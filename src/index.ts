@@ -532,13 +532,21 @@ const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
  * retry loop. A property on an Error would be dropped by every one of those
  * paths and the class would work in tests and vanish in production.
  *
- * Written as a sentence rather than a sigil because it is going to be read by
- * whoever gets the error, and "our own service, not a third party" is the
- * single most useful thing to tell them — fetchWithTimeout's own comment
- * (fleet #1047) is about exactly this ambiguity, where blaming a healthy vendor
- * by name sent the next person waiting for an outage that did not exist.
+ * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
+ * string is appended to a pack's thrown Error message (shared/src/http.ts),
+ * and a thrown Error's message is exactly what the gateway hands back to the
+ * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
+ * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
+ * which does not touch this suffix) — so the original wording,
+ * " [pipeworx-hosted origin — our own service, not a third party]", was not a
+ * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
+ * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
+ * naming Pipeworx as the host. check:hosting-claims never caught it because it
+ * did not scan shared/ at all (task #2009). Reworded to describe the
+ * OBSERVATION (the origin did not answer) without a claim about who runs it —
+ * the identical fix labelAge got: drop the possessive, keep the fact.
  */
-const INTERNAL_ORIGIN_MARKER = ' [pipeworx-hosted origin — our own service, not a third party]';
+const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
 
 /**
  * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
@@ -563,6 +571,17 @@ const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
  * hosted on workers.dev, so the suffix says where something runs and not who
  * owns it. Every internal call we actually make goes to a `pipeworx.io`
  * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
+ * question and DOES include `workers.dev` — a documented divergence
+ * (task #2051), not a bug to converge. That list decides what a response may
+ * cite as a data SOURCE, where a false negative (citing our own worker as an
+ * external source) is the hosting-disclosure leak this whole file exists to
+ * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
+ * outage metrics read by on-call, where a false positive (crediting our own
+ * infra with a third party's outage) hides the real failure, so it errs
+ * narrow. Same suffix, opposite direction, because they are never called for
+ * the same reason.
  *
  * Returns false on anything unparseable rather than throwing — this runs inside
  * an error path, and an error path that can itself throw turns a diagnosable

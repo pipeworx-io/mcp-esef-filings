@@ -25,6 +25,203 @@ interface McpToolExport {
 }
 
 /**
+ * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
+ *
+ * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
+ * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
+ * covered the majority and structurally could not cover the rest: the rest
+ * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
+ * the 24h to 2026-09-02T15:00Z (fleet #1096):
+ *
+ *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
+ *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
+ *
+ * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
+ * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
+ * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
+ * our own Supabase for fleet. There is no third party anywhere in either call.
+ * Same defect as #1089: our own outage filed under `upstream_down`, the one
+ * class that means "the source is unreachable and there is nothing for us to
+ * fix", which is why the problem-tools triage skips it.
+ *
+ * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
+ * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
+ * one site today, so it would work today. It would also rot the first time
+ * somebody rewords a label — silently, and in the direction of hiding our own
+ * outage, which is worse than the bug being fixed. Every prose rule in
+ * error-class.ts has needed widening as packs invented new wording (#409/#450/
+ * #584); that history is most of that file's comment budget.
+ *
+ * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
+ * hostname is a fact about the call, not a guess about its prose. Two
+ * consequences that a pack-level flag could not give us, and the reason the
+ * flag was rejected:
+ *
+ *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
+ *     Supabase AND to genuine third parties; `court-listener` holds our cache
+ *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
+ *     either pack would relabel a real third-party outage as ours — inventing
+ *     work, which is the same class of error in the opposite direction.
+ *   - It covers every future internal pack for free, instead of one declared
+ *     slug at a time.
+ *
+ * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
+ * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
+ * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
+ * this module — so changing the wording changes both sides in the same edit and
+ * cannot desynchronise them. The pack's own label (`fleet db error:`,
+ * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
+ * unaffected. That is the property `stripClassPrefix` lacked when it drifted
+ * from its own classifier three times and needed a CI gate to hold them
+ * together.
+ *
+ * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
+ * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
+ * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
+ * availability failure" is decided from the actual status code, never re-derived
+ * by scraping a number out of a sentence. A 404 from our own registry for a slug
+ * that does not exist is a caller's bad argument and is deliberately NOT marked.
+ */
+
+/**
+ * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
+ *
+ * ONE value, not three, unlike `internal_db_*`. That split existed because a
+ * slow query, an exhausted pool and an unknown SQLSTATE have different owners
+ * and different fixes. Here there is only one story to tell — an origin we run
+ * did not answer the edge — and one owner. A bucket with no distinct owner per
+ * value is decoration; #724 is what happens when a class holds several
+ * situations, and inventing sub-values ahead of a reason to act on them
+ * differently is the same mistake with the sign flipped.
+ *
+ * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
+ * values. `classifyToolError` still answers `upstream_down` for the retry and
+ * hint paths, which only care whether retrying or a sibling tool might work —
+ * and it might. Nothing a caller sees or is charged changes here.
+ *
+ * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
+ * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
+ * lands on no dashboard — fleet #721 is the warning, where the #719 split
+ * worked on the write side and was invisible for weeks.
+ */
+const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
+
+/**
+ * The token that carries "this origin is ours" from the call site to the
+ * classifier.
+ *
+ * Appended to the error message rather than attached to the Error object,
+ * because the object does not survive the trip: 275 packs return `{ error:
+ * string }` instead of throwing, the gateway reads `observedError` as a string,
+ * and the fleet pack rebuilds its error from a captured status + body across a
+ * retry loop. A property on an Error would be dropped by every one of those
+ * paths and the class would work in tests and vanish in production.
+ *
+ * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
+ * string is appended to a pack's thrown Error message (shared/src/http.ts),
+ * and a thrown Error's message is exactly what the gateway hands back to the
+ * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
+ * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
+ * which does not touch this suffix) — so the original wording,
+ * " [pipeworx-hosted origin — our own service, not a third party]", was not a
+ * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
+ * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
+ * naming Pipeworx as the host. check:hosting-claims never caught it because it
+ * did not scan shared/ at all (task #2009). Reworded to describe the
+ * OBSERVATION (the origin did not answer) without a claim about who runs it —
+ * the identical fix labelAge got: drop the possessive, keep the fact.
+ */
+const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
+
+/**
+ * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
+ * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ *
+ * Matching the shape rather than listing the ref keeps this correct when we add
+ * a project — `supabaseEnv` on a pack entry already points some packs at a
+ * second one — while still excluding `status.supabase.co`, which is Supabase's
+ * own status page and emphatically not our database. Verified 2026-09-02 by
+ * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
+ * only real project ref anywhere in the tree is ours, the rest are doc
+ * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
+ * finding internal-db-class.ts relies on for the PostgREST envelope being ours
+ * by construction.
+ */
+const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
+
+/**
+ * Is this a host WE run?
+ *
+ * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
+ * hosted on workers.dev, so the suffix says where something runs and not who
+ * owns it. Every internal call we actually make goes to a `pipeworx.io`
+ * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
+ * question and DOES include `workers.dev` — a documented divergence
+ * (task #2051), not a bug to converge. That list decides what a response may
+ * cite as a data SOURCE, where a false negative (citing our own worker as an
+ * external source) is the hosting-disclosure leak this whole file exists to
+ * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
+ * outage metrics read by on-call, where a false positive (crediting our own
+ * infra with a third party's outage) hides the real failure, so it errs
+ * narrow. Same suffix, opposite direction, because they are never called for
+ * the same reason.
+ *
+ * Returns false on anything unparseable rather than throwing — this runs inside
+ * an error path, and an error path that can itself throw turns a diagnosable
+ * failure into a mystery.
+ */
+function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
+  if (!url) return false;
+  let host: string;
+  try {
+    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
+  return SUPABASE_PROJECT_HOST.test(host);
+}
+
+/**
+ * Append the marker when this failure was OUR origin failing to answer.
+ *
+ * `status` is the HTTP status when there is one, and omitted for a timeout —
+ * where there is no response at all, and "the origin did not answer" is the
+ * whole observation. Statuses below 500 are left alone: a 404 from our own
+ * registry for a slug that does not exist is the caller's argument, not our
+ * outage, and marking it would put ordinary 404s on the incident dashboard.
+ *
+ * Idempotent, so a message that is wrapped and re-marked on the way up (the
+ * fleet pack's retry loop re-throws through two layers) carries the marker once.
+ */
+function markInternalOrigin(
+  message: string,
+  url: string | URL | undefined | null,
+  status?: number,
+): string {
+  if (status !== undefined && status < 500) return message;
+  if (!isPipeworxOrigin(url)) return message;
+  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
+  return message + INTERNAL_ORIGIN_MARKER;
+}
+
+/**
+ * Which blob4 value a failure from our own web services books as, or undefined
+ * if this is not one.
+ *
+ * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
+ * from our own Supabase is a strictly more specific statement about the same
+ * row (which of our services, and why), and the two cannot disagree about
+ * whether the failure is ours.
+ */
+function internalHostMetricsClass(error: string): string | undefined {
+  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
+}
+
+
+/**
  * One place to turn a failed `fetch` into an error a caller can act on.
  *
  * Nearly every pack was written the same way:
@@ -438,202 +635,6 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
-
-/**
- * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
- *
- * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
- * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
- * covered the majority and structurally could not cover the rest: the rest
- * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
- * the 24h to 2026-09-02T15:00Z (fleet #1096):
- *
- *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
- *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
- *
- * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
- * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
- * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
- * our own Supabase for fleet. There is no third party anywhere in either call.
- * Same defect as #1089: our own outage filed under `upstream_down`, the one
- * class that means "the source is unreachable and there is nothing for us to
- * fix", which is why the problem-tools triage skips it.
- *
- * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
- * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
- * one site today, so it would work today. It would also rot the first time
- * somebody rewords a label — silently, and in the direction of hiding our own
- * outage, which is worse than the bug being fixed. Every prose rule in
- * error-class.ts has needed widening as packs invented new wording (#409/#450/
- * #584); that history is most of that file's comment budget.
- *
- * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
- * hostname is a fact about the call, not a guess about its prose. Two
- * consequences that a pack-level flag could not give us, and the reason the
- * flag was rejected:
- *
- *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
- *     Supabase AND to genuine third parties; `court-listener` holds our cache
- *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
- *     either pack would relabel a real third-party outage as ours — inventing
- *     work, which is the same class of error in the opposite direction.
- *   - It covers every future internal pack for free, instead of one declared
- *     slug at a time.
- *
- * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
- * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
- * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
- * this module — so changing the wording changes both sides in the same edit and
- * cannot desynchronise them. The pack's own label (`fleet db error:`,
- * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
- * unaffected. That is the property `stripClassPrefix` lacked when it drifted
- * from its own classifier three times and needed a CI gate to hold them
- * together.
- *
- * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
- * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
- * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
- * availability failure" is decided from the actual status code, never re-derived
- * by scraping a number out of a sentence. A 404 from our own registry for a slug
- * that does not exist is a caller's bad argument and is deliberately NOT marked.
- */
-
-/**
- * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
- *
- * ONE value, not three, unlike `internal_db_*`. That split existed because a
- * slow query, an exhausted pool and an unknown SQLSTATE have different owners
- * and different fixes. Here there is only one story to tell — an origin we run
- * did not answer the edge — and one owner. A bucket with no distinct owner per
- * value is decoration; #724 is what happens when a class holds several
- * situations, and inventing sub-values ahead of a reason to act on them
- * differently is the same mistake with the sign flipped.
- *
- * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
- * values. `classifyToolError` still answers `upstream_down` for the retry and
- * hint paths, which only care whether retrying or a sibling tool might work —
- * and it might. Nothing a caller sees or is charged changes here.
- *
- * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
- * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
- * lands on no dashboard — fleet #721 is the warning, where the #719 split
- * worked on the write side and was invisible for weeks.
- */
-const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
-
-/**
- * The token that carries "this origin is ours" from the call site to the
- * classifier.
- *
- * Appended to the error message rather than attached to the Error object,
- * because the object does not survive the trip: 275 packs return `{ error:
- * string }` instead of throwing, the gateway reads `observedError` as a string,
- * and the fleet pack rebuilds its error from a captured status + body across a
- * retry loop. A property on an Error would be dropped by every one of those
- * paths and the class would work in tests and vanish in production.
- *
- * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
- * string is appended to a pack's thrown Error message (shared/src/http.ts),
- * and a thrown Error's message is exactly what the gateway hands back to the
- * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
- * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
- * which does not touch this suffix) — so the original wording,
- * " [pipeworx-hosted origin — our own service, not a third party]", was not a
- * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
- * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
- * naming Pipeworx as the host. check:hosting-claims never caught it because it
- * did not scan shared/ at all (task #2009). Reworded to describe the
- * OBSERVATION (the origin did not answer) without a claim about who runs it —
- * the identical fix labelAge got: drop the possessive, keep the fact.
- */
-const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
-
-/**
- * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
- * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
- *
- * Matching the shape rather than listing the ref keeps this correct when we add
- * a project — `supabaseEnv` on a pack entry already points some packs at a
- * second one — while still excluding `status.supabase.co`, which is Supabase's
- * own status page and emphatically not our database. Verified 2026-09-02 by
- * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
- * only real project ref anywhere in the tree is ours, the rest are doc
- * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
- * finding internal-db-class.ts relies on for the PostgREST envelope being ours
- * by construction.
- */
-const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
-
-/**
- * Is this a host WE run?
- *
- * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
- * hosted on workers.dev, so the suffix says where something runs and not who
- * owns it. Every internal call we actually make goes to a `pipeworx.io`
- * hostname or to our Supabase project, both of which are ownership facts.
- *
- * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
- * question and DOES include `workers.dev` — a documented divergence
- * (task #2051), not a bug to converge. That list decides what a response may
- * cite as a data SOURCE, where a false negative (citing our own worker as an
- * external source) is the hosting-disclosure leak this whole file exists to
- * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
- * outage metrics read by on-call, where a false positive (crediting our own
- * infra with a third party's outage) hides the real failure, so it errs
- * narrow. Same suffix, opposite direction, because they are never called for
- * the same reason.
- *
- * Returns false on anything unparseable rather than throwing — this runs inside
- * an error path, and an error path that can itself throw turns a diagnosable
- * failure into a mystery.
- */
-function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
-  if (!url) return false;
-  let host: string;
-  try {
-    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
-  return SUPABASE_PROJECT_HOST.test(host);
-}
-
-/**
- * Append the marker when this failure was OUR origin failing to answer.
- *
- * `status` is the HTTP status when there is one, and omitted for a timeout —
- * where there is no response at all, and "the origin did not answer" is the
- * whole observation. Statuses below 500 are left alone: a 404 from our own
- * registry for a slug that does not exist is the caller's argument, not our
- * outage, and marking it would put ordinary 404s on the incident dashboard.
- *
- * Idempotent, so a message that is wrapped and re-marked on the way up (the
- * fleet pack's retry loop re-throws through two layers) carries the marker once.
- */
-function markInternalOrigin(
-  message: string,
-  url: string | URL | undefined | null,
-  status?: number,
-): string {
-  if (status !== undefined && status < 500) return message;
-  if (!isPipeworxOrigin(url)) return message;
-  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
-  return message + INTERNAL_ORIGIN_MARKER;
-}
-
-/**
- * Which blob4 value a failure from our own web services books as, or undefined
- * if this is not one.
- *
- * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
- * from our own Supabase is a strictly more specific statement about the same
- * row (which of our services, and why), and the two cannot disagree about
- * whether the failure is ours.
- */
-function internalHostMetricsClass(error: string): string | undefined {
-  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
-}
 /**
  * XBRL filings index MCP — wraps the filings.xbrl.org JSON:API index run by
  * XBRL International, plus the machine-readable xBRL-JSON report behind each
@@ -913,7 +914,14 @@ function entityIndex(env: Envelope<unknown>): Map<string, string> {
 // filings" rendered over the full 25,640-row index.
 function verifyFilters(
   rows: Array<{ country: string | null; regime: string | null; period_end: string | null }>,
-  want: { country?: string; regime?: string; period_end?: string; year?: number },
+  want: {
+    country?: string;
+    regime?: string;
+    period_end?: string;
+    year?: number;
+    period_end_from?: string;
+    period_end_to?: string;
+  },
 ): { verified: boolean; mismatches: number } {
   let mismatches = 0;
   for (const r of rows) {
@@ -921,9 +929,41 @@ function verifyFilters(
     else if (want.regime && (r.regime ?? '').toUpperCase() !== want.regime.toUpperCase()) mismatches++;
     else if (want.period_end && r.period_end !== want.period_end) mismatches++;
     else if (want.year && !(r.period_end ?? '').startsWith(String(want.year))) mismatches++;
+    else if (want.period_end_from && (r.period_end ?? '') < want.period_end_from) mismatches++;
+    else if (want.period_end_to && (r.period_end ?? '') > want.period_end_to) mismatches++;
   }
   return { verified: mismatches === 0, mismatches };
 }
+
+// fleet #2317: `filters_verified` used to mean only "the rows match the
+// filters we RECOGNISED" — an argument this pack didn't parse (period_end_from,
+// period_end_to) was silently dropped before verifyFilters ever saw it, so the
+// field could read `true` while a supplied filter did nothing. The invariant
+// now is: filters_verified reflects EVERY argument the caller actually passed,
+// because rejectUnknownArgs() below throws before an unrecognised key can be
+// dropped, and period_end_from/period_end_to are real filters, not aliases
+// left unparsed.
+function rejectUnknownArgs(args: Record<string, unknown>, accepted: readonly string[], toolLabel: string): void {
+  const acceptedSet = new Set(accepted);
+  const unknown = Object.keys(args).filter((k) => !acceptedSet.has(k));
+  if (unknown.length) {
+    throw new Error(
+      `user_error: ${toolLabel} does not recognise argument(s) ${unknown.map((k) => `"${k}"`).join(', ')}. ` +
+        `They would otherwise be silently discarded and the response would misreport filters as verified. ` +
+        `Accepted arguments: ${accepted.join(', ')}.`,
+    );
+  }
+}
+
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// fleet #2317, Defect B: the upstream index is a voluntary community feed, not
+// a real-time filing tape. Measured live 2026-09-23 via `esef_search_filings`
+// with the `year` filter: Portugal 2023=7, 2024=7, 2025=0; Spain 2023=125,
+// 2024=113, 2025=1. Surfaced on every search response (not just README GOTCHA
+// 9) so a caller learns this from the tool, not from a query that returns zero.
+const COVERAGE_NOTE =
+  'Coverage lags the reporting period by roughly a filing season, not real time — this is a voluntary community-run index, not a live regulator feed. Measured 2026-09-23 via the `year` filter: Portugal had 7 ESEF filings for 2023, 7 for 2024, 0 for 2025; Spain had 125 for 2023, 113 for 2024, 1 for 2025. A search for the current calendar year will typically return few or no rows — that is upstream lag, not a broken query or an empty scope. Widen `year` to the prior 1-2 years, or use `period_end_from`/`period_end_to` to see the true edge of what has been indexed so far.';
 
 // ── tool definitions ───────────────────────────────────────────────────────
 const SCOPE_LINE =
@@ -933,9 +973,9 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'esef_search_filings',
     description:
-      'Search the XBRL International filings index (filings.xbrl.org) for published company annual reports. Answers "which European companies have filed an annual report for 2023", "does Nokia have an ESEF filing", "list Finnish filings with validation errors". Returns per filing: company name, LEI or national identifier, country, reporting regime, period end, XBRL validation error/warning counts, report language, and direct links to the machine-readable xBRL-JSON, the inline-XBRL HTML report and the viewer. Filter by company name (substring), country (ISO-2), regime, period end date or calendar year. ' +
+      'Search the XBRL International filings index (filings.xbrl.org) for published company annual reports. Answers "which European companies have filed an annual report for 2023", "does Nokia have an ESEF filing", "list Finnish filings with validation errors", "Portuguese filings with a period end after 2024-06-30". Returns per filing: company name, LEI or national identifier, country, reporting regime, period end, XBRL validation error/warning counts, report language, and direct links to the machine-readable xBRL-JSON, the inline-XBRL HTML report and the viewer. Filter by company name (substring), country (ISO-2), regime, exact period end date, calendar year, or a period_end_from/period_end_to date range. Any other argument name is rejected with a user_error rather than silently ignored. ' +
       SCOPE_LINE +
-      ' Reports the index-wide match count and echoes back proof that the filters actually applied. Follow up with esef_filing_facts to get the numbers inside a filing.',
+      ' Coverage of the current calendar year is sparse — the index lags the filing season; see the response `coverage_note`. Reports the index-wide match count and echoes back proof that the filters actually applied. Follow up with esef_filing_facts to get the numbers inside a filing.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -960,7 +1000,17 @@ const tools: McpToolExport['tools'] = [
         },
         period_end: {
           type: 'string',
-          description: 'Exact reporting period end date, ISO format, e.g. "2023-12-31". Takes precedence over `year`.',
+          description: 'Exact reporting period end date, ISO format, e.g. "2023-12-31". Takes precedence over `year` and over `period_end_from`/`period_end_to`.',
+        },
+        period_end_from: {
+          type: 'string',
+          description:
+            'Only filings whose reporting period end is on or after this ISO date, e.g. "2024-01-01". Combine with `period_end_to` for a range; either bound may be used alone. Ignored if `period_end` (exact) is also set; takes precedence over `year`.',
+        },
+        period_end_to: {
+          type: 'string',
+          description:
+            'Only filings whose reporting period end is on or before this ISO date, e.g. "2024-12-31". Combine with `period_end_from` for a range; either bound may be used alone. Ignored if `period_end` (exact) is also set; takes precedence over `year`.',
         },
         with_errors: {
           type: 'boolean',
@@ -1066,11 +1116,42 @@ function str(v: unknown): string | undefined {
   return t ? t : undefined;
 }
 
+// fleet #2317: every accepted top-level argument, kept in one place so
+// rejectUnknownArgs() and the inputSchema/description above cannot drift
+// apart. `company`/`name` are documented handler-side aliases for
+// `entity_name` — both are declared here precisely because an alias that
+// isn't in this list is dead per reference_partial_hides_total_failure.
+const SEARCH_FILINGS_ARGS = [
+  'entity_name',
+  'company',
+  'name',
+  'country',
+  'regime',
+  'year',
+  'period_end',
+  'period_end_from',
+  'period_end_to',
+  'with_errors',
+  'sort',
+  'limit',
+  'page',
+] as const;
+
 async function searchFilings(args: Record<string, unknown>) {
+  rejectUnknownArgs(args, SEARCH_FILINGS_ARGS, 'esef_search_filings');
+
   const entityName = str(args.entity_name) ?? str(args.company) ?? str(args.name);
   const country = str(args.country)?.toUpperCase();
   const regime = str(args.regime)?.toUpperCase();
   const periodEnd = str(args.period_end);
+  const periodEndFrom = str(args.period_end_from);
+  const periodEndTo = str(args.period_end_to);
+  if (periodEndFrom && !ISO_DATE_RE.test(periodEndFrom)) {
+    throw new Error(`user_error: period_end_from must be an ISO date like "2024-01-01". Got "${periodEndFrom}".`);
+  }
+  if (periodEndTo && !ISO_DATE_RE.test(periodEndTo)) {
+    throw new Error(`user_error: period_end_to must be an ISO date like "2024-12-31". Got "${periodEndTo}".`);
+  }
   const year = args.year != null ? clampInt(args.year, 0, 1990, 2100) : undefined;
   const limit = clampInt(args.limit, 20, 1, 100);
   const page = clampInt(args.page, 1, 1, 10000);
@@ -1084,7 +1165,12 @@ async function searchFilings(args: Record<string, unknown>) {
   // dashes so "ESEF" cannot match part of an entity identifier.
   if (regime) filters.push({ name: 'fxo_id', op: 'ilike', val: `%-${regime}-%` });
   if (periodEnd) {
+    // Exact date wins outright — a range alongside it would be redundant at
+    // best and contradictory at worst, so it is simply not consulted.
     filters.push({ name: 'period_end', op: 'eq', val: periodEnd });
+  } else if (periodEndFrom || periodEndTo) {
+    if (periodEndFrom) filters.push({ name: 'period_end', op: 'ge', val: periodEndFrom });
+    if (periodEndTo) filters.push({ name: 'period_end', op: 'le', val: periodEndTo });
   } else if (year) {
     filters.push({ name: 'period_end', op: 'ge', val: `${year}-01-01` });
     filters.push({ name: 'period_end', op: 'le', val: `${year}-12-31` });
@@ -1100,16 +1186,33 @@ async function searchFilings(args: Record<string, unknown>) {
   });
 
   const total = env.meta?.count ?? null;
-  const check = verifyFilters(rows, { country, regime, period_end: periodEnd, year });
+  const check = verifyFilters(rows, {
+    country,
+    regime,
+    period_end: periodEnd,
+    year,
+    period_end_from: periodEndFrom,
+    period_end_to: periodEndTo,
+  });
+  const filtersRequested = {
+    entity_name: entityName ?? null,
+    country: country ?? null,
+    regime: regime ?? null,
+    period_end: periodEnd ?? null,
+    period_end_from: periodEndFrom ?? null,
+    period_end_to: periodEndTo ?? null,
+    year: year ?? null,
+  };
 
   if (!rows.length) {
     return {
       found: false,
       reason: 'no_filings_match',
       hint:
-        'No filing in the index matches those criteria. Widen the search: drop `year` (the index runs from roughly 2020 period-ends onward and a report appears months after the period closes), shorten `entity_name` to a distinctive fragment of the legal name (try "Citycon" rather than "Citycon Oyj Plc"), or drop `country` — a group can file in a jurisdiction other than the one you expect.',
+        'No filing in the index matches those criteria. Widen the search: drop `year`/`period_end_from`/`period_end_to` (the index runs from roughly 2020 period-ends onward, lags the reporting period by a filing season, and a report appears months after the period closes — see coverage_note), shorten `entity_name` to a distinctive fragment of the legal name (try "Citycon" rather than "Citycon Oyj Plc"), or drop `country` — a group can file in a jurisdiction other than the one you expect.',
       total_matching: total,
-      filters_requested: { entity_name: entityName ?? null, country: country ?? null, regime: regime ?? null, period_end: periodEnd ?? null, year: year ?? null },
+      filters_requested: filtersRequested,
+      coverage_note: COVERAGE_NOTE,
       source: 'filings.xbrl.org',
     };
   }
@@ -1120,12 +1223,18 @@ async function searchFilings(args: Record<string, unknown>) {
     returned: rows.length,
     page,
     // Proof the narrowing happened, not just that the server said 200.
-    filters_requested: { entity_name: entityName ?? null, country: country ?? null, regime: regime ?? null, period_end: periodEnd ?? null, year: year ?? null },
+    // Invariant (fleet #2317): this can only read true if every argument the
+    // caller actually supplied was both parsed as a real filter AND matched by
+    // every returned row — rejectUnknownArgs() above throws before an
+    // unrecognised argument ever reaches this point, so there is no path left
+    // where a supplied filter is silently dropped yet this reads true.
+    filters_requested: filtersRequested,
     filters_applied: filters.length > 0,
     filters_verified: check.verified,
     filter_mismatches: check.mismatches,
     scope_note:
       'This index carries both ESEF (European annual financial reports) and UAIFRS (Ukrainian IFRS) filings. Each row states its own country and regime.',
+    coverage_note: COVERAGE_NOTE,
     filings: rows,
     source: 'filings.xbrl.org (XBRL International filings index)',
     query_url: url,

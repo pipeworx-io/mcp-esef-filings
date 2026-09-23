@@ -2,13 +2,13 @@
 
 XBRL filings index MCP — published company annual reports from the filings.xbrl.org index run by XBRL International, plus the IFRS financial facts inside each one. Keyless.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1576+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1663+ live data sources.
 
 The European counterpart to `sec-xbrl`: same idea (accounting facts straight out of a regulator's XBRL), different filing regime.
 
 ## Tools
 
-- `esef_search_filings(entity_name?, country?, regime?, year?, period_end?, with_errors?, sort?, limit?, page?)` — search the index. Returns company name, LEI or national identifier, country, regime, period end, XBRL validation error/warning counts, report language and links to the xBRL-JSON, HTML report, viewer and package.
+- `esef_search_filings(entity_name?, country?, regime?, year?, period_end?, period_end_from?, period_end_to?, with_errors?, sort?, limit?, page?)` — search the index. Returns company name, LEI or national identifier, country, regime, period end, XBRL validation error/warning counts, report language and links to the xBRL-JSON, HTML report, viewer and package. Any argument not in this list is rejected with a `user_error` naming the accepted set — it is never silently dropped (see GOTCHA 1).
 - `esef_entity_filings(entity, limit?)` — every filing for one company, resolving a name, LEI or national registration number. Returns what it resolved to and how, plus filings grouped into distinct reports (see "Language editions" below).
 - `esef_filing_facts(fxo_id? | entity?, year?, concept?, include_dimensioned?, limit?)` — the second hop. Opens the filing's xBRL-JSON report and returns named IFRS facts with value, currency, period and concept.
 
@@ -52,6 +52,8 @@ Two defences, both in `src/index.ts`:
 1. **The pack never uses the bracketed shortcut for filters.** It uses the flask-rest-jsonapi complex form, `?filter=[{"name":"country","op":"eq","val":"FI"}]` — a single unbracketed param, so there is no bracket encoding to get wrong, *and* a bad attribute name is rejected loudly (`HTTP 400 "FilingSchema has no attribute bogus"`) instead of ignored. Only `page[size]` / `page[number]` are bracketed, and they go through `buildUrl()`, which uses `URLSearchParams` (which percent-encodes brackets).
 2. **`verifyFilters()` re-checks the returned rows** against what was asked for. Every `esef_search_filings` response carries `filters_applied`, `filters_verified` and `filter_mismatches`, so a filter that somehow failed to bite shows up in the payload rather than quietly widening the answer.
 
+**The same failure mode existed one layer up, on our own tool boundary, and got fixed the same way (fleet #2317).** `esef_search_filings` never declared `period_end_from`/`period_end_to`, so a caller who guessed those (a plausible name for a date range) had the arguments silently dropped by the handler — no schema error, `filters_requested` echoed them as `null`, and the response still claimed `filters_verified: true`. A date-bounded query for Portugal returned the identical 128-row unfiltered total as a query with no date at all. Fixed two ways: `period_end_from`/`period_end_to` are now real, declared range filters (`op: 'ge'`/`'le'` against `period_end`, verified by `verifyFilters()` like every other filter), and `rejectUnknownArgs()` throws a `user_error` naming the accepted argument list for anything else the caller might guess — so an undeclared argument can no longer be dropped silently, whatever its name.
+
 ### GOTCHA 2 — this index is not ESEF-only, and saying otherwise is a wrong answer
 
 An unfiltered probe's first record is Ukrainian: `EDRPOU-32033791-2020-12-31-UAIFRS-UA-0`. 38% of the index is UAIFRS. Describing the pack as "European filings" while it can return Ukraine is the resolver-grain trap — the caller gets a confident answer at the wrong grain.
@@ -89,6 +91,19 @@ An xBRL-JSON instant period of `2023-01-01T00:00:00` is the **2022-12-31** balan
 ### GOTCHA 8 — narrative notes are tagged as facts
 
 `DisclosureOfShareCapitalReservesAndOtherEquityInterestExplanatory` in Citycon's FY2022 report is 2,500 characters of prose. Text values are clipped at 600 characters with `value_truncated` / `value_length` set, and within a period measured figures sort ahead of narrative, so `concept: "Equity"` leads with the EUR 2,310,300,000 balance rather than pages of note text.
+
+### GOTCHA 9 — the index lags the filing season; current-year coverage is close to empty
+
+This is not a bug in the pack, but it is the gotcha that actually costs users, and it went undocumented for a while (fleet #2317 — an external developer independently measured these same counts and rejected the pack over it). `filings.xbrl.org` is a voluntary community index, not a real-time regulator feed: a company's annual report typically lands weeks to months after the reporting period closes and after XBRL International (or a national collector) has processed it.
+
+Measured live 2026-09-23 via `esef_search_filings` with the `year` filter:
+
+| Country | 2023 | 2024 | 2025 |
+|---|---|---|---|
+| PT | 7 | 7 | 0 |
+| ES | 125 | 113 | 1 |
+
+A search for the current calendar year will typically come back with few or zero rows — that reflects upstream lag, not a broken query or a country with no filers. If you are building a pipeline that expects near-real-time coverage of the current fiscal year, this index will disappoint you; the prior 1-2 calendar years is where it is actually populated. Every `esef_search_filings` response (matches and no-matches alike) now carries this as a machine-readable `coverage_note` so a caller learns it from the tool rather than from a query that quietly returns zero.
 
 ## Data sources
 
@@ -140,7 +155,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1576+ data sources. The
+Both URLs reach the same gateway and the same 1663+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

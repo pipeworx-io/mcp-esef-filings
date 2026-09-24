@@ -25,6 +25,93 @@ interface McpToolExport {
 }
 
 /**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -811,6 +898,8 @@ interface XbrlFactDimensions {
 interface XbrlFact {
   value: string | number | null;
   decimals?: number;
+  /** original length when the source already clipped a long text value */
+  _fullLength?: number;
   dimensions: XbrlFactDimensions;
 }
 
@@ -875,18 +964,80 @@ function relatedEntityIdentifier(rec: FilingRecord): string | null {
   return tail ? decodeURIComponent(tail) : null;
 }
 
-function shapeFiling(rec: FilingRecord, entityName: string | null) {
+interface OamRef {
+  filing_id: string;
+  published_at: string | null;
+}
+
+interface XbrlOrgRef {
+  fxo_id: string;
+  date_added: string | null;
+  error_count: number | null;
+  json_url: string | null;
+}
+
+// One filing row, whichever source it came from. `source` names the index the
+// row was read from; `published_at` is the regulator's official publication
+// timestamp where one is known (CMVM stamps every disclosure to the minute,
+// CNMV to the minute where its disclosure feed carries the filing and to the
+// day otherwise; filings.xbrl.org only records when IT added the row, which is
+// `date_added`).
+interface FilingRow {
+  filing_id: string;
+  fxo_id: string;
+  source: 'xbrl.org' | OamId;
+  entity_name: string | null;
+  entity_identifier: string | null;
+  country: string | null;
+  regime: string | null;
+  period_end: string | null;
+  language: string | null;
+  published_at: string | null;
+  date_added: string | null;
+  error_count: number | null;
+  warning_count: number | null;
+  inconsistency_count: number | null;
+  has_machine_readable_report: boolean;
+  json_url: string | null;
+  report_url: string | null;
+  viewer_url: string | null;
+  package_url: string | null;
+  first_published_at?: string | null;
+  indexed_at?: string | null;
+  title?: string | null;
+  package_sha256?: string | null;
+  source_url?: string | null;
+  /** CNMV: which accounts the row carries when an issuer files both */
+  report_scope?: string | null;
+  /** CNMV: the issuer's Spanish NIF; STORI: the Belgian KBO/BCE company number */
+  national_identifier?: string | null;
+  /** STORI: when the FSMA's database received the report (published_at is the issuer's own publication time) */
+  received_at?: string | null;
+  versions?: Array<{ filing_id: string; published_at: string | null; title: string | null }>;
+  also_on_cmvm?: OamRef;
+  also_on_cnmv?: OamRef;
+  also_on_newsweb?: OamRef;
+  also_on_fi?: OamRef;
+  also_on_fsma?: OamRef;
+  also_on_xbrl_org?: XbrlOrgRef;
+  /** internal: dataset key of the xBRL-JSON for a regulator (CMVM/CNMV) row; stripped before output */
+  _json_key?: string | null;
+}
+
+function shapeFiling(rec: FilingRecord, entityName: string | null): FilingRow {
   const a = rec.attributes;
   const parsed = parseFxoId(a.fxo_id);
   return {
     filing_id: rec.id,
     fxo_id: a.fxo_id,
+    source: 'xbrl.org',
     entity_name: entityName,
     entity_identifier: relatedEntityIdentifier(rec) ?? parsed.entity_identifier,
     country: a.country ?? parsed.country,
     regime: parsed.regime,
     period_end: a.period_end ?? parsed.period_end,
     language: languageFromReportPath(a.json_url) ?? languageFromReportPath(a.report_url),
+    published_at: null,
     date_added: a.date_added,
     error_count: a.error_count,
     warning_count: a.warning_count,
@@ -907,6 +1058,385 @@ function entityIndex(env: Envelope<unknown>): Map<string, string> {
     }
   }
   return map;
+}
+
+// ── National storage mechanisms: CMVM (Portugal, #2320), CNMV (Spain, #2351),
+//    Oslo Børs NewsWeb (Norway, #2356) ─
+//
+// filings.xbrl.org barely covers the current season for some countries:
+// Portugal had 7 filings for 2024 and 0 for 2025, Spain 113 for 2024 and 1 for
+// 2025, against every listed issuer filing an ESEF package with its regulator.
+// Norway is worse: filings.xbrl.org stopped ingesting it on 2025-05-21 (NO
+// FY2024 = 220 rows, FY2025 = 0-2), while every Oslo-listed issuer attaches its
+// ESEF package to its annual-report announcement on NewsWeb.
+// Those rows therefore also come from the regulator's own register, keyed by
+// the LEI inside each filing's inline XBRL — the same key filings.xbrl.org
+// uses, so a report present on both appears ONCE (dedup by LEI + period end).
+//
+// Each regulator's index reaches this pack through a gateway-injected binding
+// (`_r2`), one R2 object per source, written by scripts/esef-cmvm/ (collect.py
+// for CMVM, collect_cnmv.py for CNMV, collect_newsweb.py for NewsWeb). With no binding (a bare npm install of
+// this pack) the tools still answer from filings.xbrl.org and say, in the
+// source's status block, that its rows are absent — they never silently
+// return a smaller answer as if it were complete.
+
+interface R2Bucketish {
+  get(key: string): Promise<{ text(): Promise<string> } | null>;
+}
+
+type OamId = 'cmvm' | 'cnmv' | 'newsweb' | 'fi' | 'fsma';
+
+interface OamSpec {
+  id: OamId;
+  country: 'PT' | 'ES' | 'NO' | 'SE' | 'BE';
+  indexKey: string;
+  /** e.g. "CMVM (Comissão do Mercado de Valores Mobiliários, Portugal)" */
+  longName: string;
+  adjective: string;
+  statusKey: 'cmvm_status' | 'cnmv_status' | 'newsweb_status' | 'fi_status' | 'fsma_status';
+  alsoOnKey: 'also_on_cmvm' | 'also_on_cnmv' | 'also_on_newsweb' | 'also_on_fi' | 'also_on_fsma';
+  idRe: RegExp;
+  /** True only when .github/workflows/esef-cmvm-refresh.yml refreshes this
+   *  index every day. The stale note says "(expected daily)" only then (#2373). */
+  scheduledDaily: boolean;
+}
+
+const OAM: Record<OamId, OamSpec> = {
+  cmvm: {
+    id: 'cmvm',
+    country: 'PT',
+    indexKey: 'esef-cmvm/index.json',
+    longName: 'CMVM (Comissão do Mercado de Valores Mobiliários, Portugal)',
+    adjective: 'Portuguese',
+    statusKey: 'cmvm_status',
+    alsoOnKey: 'also_on_cmvm',
+    idRe: /^cmvm-\d+$/i,
+    scheduledDaily: true,
+  },
+  cnmv: {
+    id: 'cnmv',
+    country: 'ES',
+    indexKey: 'esef-cnmv/index.json',
+    longName: 'CNMV (Comisión Nacional del Mercado de Valores, Spain)',
+    adjective: 'Spanish',
+    statusKey: 'cnmv_status',
+    alsoOnKey: 'also_on_cnmv',
+    idRe: /^cnmv-\d+(-\d+)?$/i,
+    scheduledDaily: true,
+  },
+  newsweb: {
+    id: 'newsweb',
+    country: 'NO',
+    indexKey: 'esef-newsweb/index.json',
+    longName: 'Oslo Børs NewsWeb (Norway)',
+    adjective: 'Norwegian',
+    statusKey: 'newsweb_status',
+    alsoOnKey: 'also_on_newsweb',
+    // newsweb-<messageId>-<attachmentId>[-<n> for the nth report in one package]
+    idRe: /^newsweb-\d+-\d+(-\d+)?$/i,
+    scheduledDaily: true,
+  },
+  // Sweden (#2355): Finansinspektionen's Börsinformation database, the Swedish
+  // OAM. filings.xbrl.org stopped ingesting SE on 2025-05-08 (0 FY2025 rows),
+  // so for Sweden this is the only current source. Written by
+  // scripts/esef-cmvm/collect_fi.py; filing ids are FI's GetFile fid.
+  fi: {
+    id: 'fi',
+    country: 'SE',
+    indexKey: 'esef-fi/index.json',
+    longName: 'Finansinspektionen (FI Börsinformation, Sweden)',
+    adjective: 'Swedish',
+    statusKey: 'fi_status',
+    alsoOnKey: 'also_on_fi',
+    idRe: /^fi-\d+$/i,
+    // Daily in .github/workflows/esef-cmvm-refresh.yml (4-day window; #2355).
+    scheduledDaily: true,
+  },
+  // Belgium (#2405): the FSMA's STORI database, the Belgian OAM, over its
+  // keyless JSON API. filings.xbrl.org carries Belgium only partly (FY2025:
+  // 33 issuers, nothing added since 2026-05-12; STORI lists 106), so BE rows
+  // merge both sources by LEI + period end. Written by
+  // scripts/esef-cmvm/collect_fsma.py; filing ids are STORI's fileDataId.
+  fsma: {
+    id: 'fsma',
+    country: 'BE',
+    indexKey: 'esef-fsma/index.json',
+    longName: 'FSMA STORI (Belgium)',
+    adjective: 'Belgian',
+    statusKey: 'fsma_status',
+    alsoOnKey: 'also_on_fsma',
+    idRe: /^fsma-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    // Daily in .github/workflows/esef-cmvm-refresh.yml (14-day window; #2405).
+    scheduledDaily: true,
+  },
+};
+const OAM_LIST: OamSpec[] = [OAM.cmvm, OAM.cnmv, OAM.newsweb, OAM.fi, OAM.fsma];
+
+function oamForId(filingId: string): OamSpec | null {
+  return OAM_LIST.find((s) => s.idRe.test(filingId)) ?? null;
+}
+
+function oamForCountry(country: string | null | undefined): OamSpec | null {
+  return OAM_LIST.find((s) => s.country === (country ?? '').toUpperCase()) ?? null;
+}
+
+interface OamIndexRow {
+  filing_id: string;
+  cmvm_id?: number;
+  register_number?: string;
+  nif?: string | null;
+  /** STORI (Belgium): KBO/BCE company number and receipt time */
+  company_number?: string | null;
+  received_at?: string | null;
+  report_scope?: string | null;
+  lei: string | null;
+  period_end: string | null;
+  entity_name: string | null;
+  title: string | null;
+  language: string | null;
+  published_at: string;
+  ingested_at: string | null;
+  source_url: string | null;
+  viewer_url: string | null;
+  zip_sha256: string | null;
+  json_key: string | null;
+  fact_count: number | null;
+  conversion_error: string | null;
+}
+
+interface OamIndex {
+  schema: number;
+  generated_at: string;
+  last_attempt: string | null;
+  last_successful_check: string | null;
+  last_error: { at: string; message: string } | null;
+  last_row_errors?: string[];
+  row_count: number;
+  rows: OamIndexRow[];
+}
+
+type OamLoad = { ok: true; idx: OamIndex } | { ok: false; reason: string };
+type OamLoads = Partial<Record<OamId, OamLoad>>;
+
+// Each index in the daily workflow (scheduledDaily) is refreshed every day. Two missed days reads as stale, so a dead
+// collector shows up here long before anyone notices a missing filing.
+const OAM_STALE_HOURS = 48;
+const OAM_CACHE_MS = 5 * 60_000;
+const oamCache: Partial<Record<OamId, { at: number; idx: OamIndex }>> = {};
+
+function r2From(args: Record<string, unknown>): R2Bucketish | null {
+  const b = args._r2 as R2Bucketish | undefined;
+  return b && typeof b.get === 'function' ? b : null;
+}
+
+async function loadOam(spec: OamSpec, args: Record<string, unknown>): Promise<OamLoad> {
+  const r2 = r2From(args);
+  if (!r2) return { ok: false, reason: `${spec.id}_source_not_connected` };
+  const hit = oamCache[spec.id];
+  if (hit && Date.now() - hit.at < OAM_CACHE_MS) return { ok: true, idx: hit.idx };
+  try {
+    const obj = await r2.get(spec.indexKey);
+    if (!obj) return { ok: false, reason: `${spec.id}_index_missing` };
+    const idx = JSON.parse(await obj.text()) as OamIndex;
+    if (!idx || !Array.isArray(idx.rows)) return { ok: false, reason: `${spec.id}_index_malformed` };
+    oamCache[spec.id] = { at: Date.now(), idx };
+    return { ok: true, idx };
+  } catch (e) {
+    return { ok: false, reason: `${spec.id}_index_unreadable: ${dropClassPrefix(e instanceof Error ? e.message : String(e))}`.slice(0, 200) };
+  }
+}
+
+async function loadAllOam(args: Record<string, unknown>, specs: OamSpec[] = OAM_LIST): Promise<OamLoads> {
+  const loads = await Promise.all(specs.map((s) => loadOam(s, args)));
+  const out: OamLoads = {};
+  specs.forEach((s, i) => {
+    out[s.id] = loads[i];
+  });
+  return out;
+}
+
+// Freshness of one regulator's side, on every response that consulted it. A
+// collector failure (last_error set, last_successful_check old) must read
+// differently from "the regulator published nothing new" (last_successful_check
+// recent, no error).
+function oamStatus(spec: OamSpec, load: OamLoad): Record<string, unknown> {
+  const short = spec.id.toUpperCase();
+  if (!load.ok) {
+    return {
+      available: false,
+      reason: load.reason,
+      note: `${spec.adjective} filings from ${short} could not be consulted for this response, so ${spec.adjective} rows come from filings.xbrl.org only and may be months behind.`,
+    };
+  }
+  const i = load.idx;
+  const last = i.last_successful_check ? Date.parse(i.last_successful_check) : NaN;
+  const ageH = Number.isFinite(last) ? Math.round(((Date.now() - last) / 3_600_000) * 10) / 10 : null;
+  const stale = ageH == null || ageH > OAM_STALE_HOURS;
+  return {
+    available: true,
+    last_successful_check: i.last_successful_check,
+    hours_since_last_successful_check: ageH,
+    last_attempt: i.last_attempt,
+    last_error: i.last_error,
+    // Individual packages the regulator listed but would not serve on the
+    // last run; they are retried on the next one and are absent until then.
+    packages_unavailable_last_run: i.last_row_errors?.length ?? 0,
+    stale,
+    filings_indexed: i.rows.length,
+    note: stale
+      ? `${short} has not been checked successfully for ${ageH ?? 'an unknown number of'} hours${spec.scheduledDaily ? ' (expected daily)' : ''}. ${spec.adjective} filings published since ${i.last_successful_check ?? 'then'} may be missing — this is a collection outage, not an absence of filings.`
+      : `${spec.adjective} (${short}) coverage is current as of last_successful_check. A ${spec.adjective} filing missing here was not on ${short} at that time; anything published since may not be indexed yet.`,
+  };
+}
+
+/** The status blocks for every regulator consulted, keyed cmvm_status / cnmv_status. */
+function oamStatuses(loads: OamLoads | null | undefined, only?: Set<OamId>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!loads) return out;
+  for (const spec of OAM_LIST) {
+    const l = loads[spec.id];
+    if (l && (!only || only.has(spec.id))) out[spec.statusKey] = oamStatus(spec, l);
+  }
+  return out;
+}
+
+const stripAccents = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '');
+const looseName = (s: string) => normName(stripAccents(s));
+
+// A regulator often carries several packages for one LEI + period: the report
+// "to be submitted to the AGM", then the AGM-approved version weeks later, a
+// replacement filing, and some issuers file a local-language and an English
+// edition. One row per LEI + period (+ report scope, where a Spanish package
+// holds individual AND consolidated accounts); the newest converted package is
+// served, the earliest publication is kept as first_published_at, and every
+// package is listed under `versions`.
+function oamFilings(spec: OamSpec, idx: OamIndex): FilingRow[] {
+  const groups = new Map<string, OamIndexRow[]>();
+  for (const r of idx.rows) {
+    const key = r.lei && r.period_end ? `${r.lei}|${r.period_end}|${r.report_scope ?? ''}` : `id|${r.filing_id}`;
+    const g = groups.get(key);
+    if (g) g.push(r);
+    else groups.set(key, [r]);
+  }
+  const out: FilingRow[] = [];
+  for (const g of groups.values()) {
+    g.sort((a, b) => b.published_at.localeCompare(a.published_at));
+    const pick = g.find((r) => r.json_key && (r.language ?? '').startsWith('en')) ?? g.find((r) => r.json_key) ?? g[0];
+    if (!pick) continue;
+    out.push(shapeOam(spec, pick, g));
+  }
+  return out;
+}
+
+function shapeOam(spec: OamSpec, r: OamIndexRow, group: OamIndexRow[] = [r]): FilingRow {
+  const first = group.reduce((m, x) => (x.published_at < m ? x.published_at : m), r.published_at);
+  return {
+    filing_id: r.filing_id,
+    fxo_id: r.filing_id,
+    source: spec.id,
+    entity_name: r.entity_name,
+    entity_identifier: r.lei,
+    country: spec.country,
+    regime: 'ESEF',
+    period_end: r.period_end,
+    language: r.language,
+    published_at: r.published_at,
+    first_published_at: first,
+    indexed_at: r.ingested_at,
+    date_added: r.ingested_at,
+    error_count: null,
+    warning_count: null,
+    inconsistency_count: null,
+    has_machine_readable_report: Boolean(r.json_key),
+    json_url: null,
+    report_url: null,
+    viewer_url: r.viewer_url,
+    package_url: null,
+    title: r.title,
+    package_sha256: r.zip_sha256,
+    source_url: r.source_url,
+    ...(r.report_scope ? { report_scope: r.report_scope } : {}),
+    ...(r.nif ? { national_identifier: r.nif } : {}),
+    ...(r.company_number ? { national_identifier: r.company_number } : {}),
+    ...(r.received_at ? { received_at: r.received_at } : {}),
+    versions:
+      group.length > 1
+        ? group.map((x) => ({ filing_id: x.filing_id, published_at: x.published_at, title: x.title }))
+        : undefined,
+    _json_key: r.json_key,
+  };
+}
+
+function findOamById(spec: OamSpec, idx: OamIndex, filingId: string): FilingRow | null {
+  const r = idx.rows.find((x) => x.filing_id.toLowerCase() === filingId || (x.cmvm_id != null && `cmvm-${x.cmvm_id}` === filingId));
+  if (!r) return null;
+  const group =
+    r.lei && r.period_end
+      ? idx.rows.filter((x) => x.lei === r.lei && x.period_end === r.period_end && (x.report_scope ?? '') === (r.report_scope ?? ''))
+      : [r];
+  return shapeOam(spec, r, group);
+}
+
+function oamMatchesName(row: FilingRow, needle: string): boolean {
+  const n = looseName(needle);
+  if (!n) return false;
+  if ((row.entity_identifier ?? '').toUpperCase() === needle.trim().toUpperCase()) return true;
+  if ((row.national_identifier ?? '').replace(/-/g, '').toUpperCase() === needle.trim().replace(/-/g, '').toUpperCase()) return true;
+  return looseName(row.entity_name ?? '').includes(n);
+}
+
+// Merge xbrl.org rows with regulator rows, one row per LEI + period end. The
+// regulator row is kept when it carries a machine-readable report (it is the
+// regulator's own copy and carries the official publication time); the
+// xbrl.org identity is attached as `also_on_xbrl_org`. Otherwise the xbrl.org
+// row is kept and picks up the regulator's publication time. Where a Spanish
+// package yields individual AND consolidated rows, the consolidated one is the
+// counterpart of the xbrl.org filing (ESEF tags the consolidated accounts);
+// the individual row stays as its own labelled row.
+function mergeRows(xbrl: FilingRow[], oam: FilingRow[]): { rows: FilingRow[]; duplicates: number } {
+  const byKey = new Map<string, FilingRow>();
+  for (const c of oam) {
+    if (!c.entity_identifier || !c.period_end) continue;
+    const key = `${c.entity_identifier}|${c.period_end}`;
+    const prev = byKey.get(key);
+    if (!prev || (prev.report_scope === 'individual' && c.report_scope !== 'individual')) byKey.set(key, c);
+  }
+  const used = new Set<string>();
+  const rows: FilingRow[] = [];
+  let duplicates = 0;
+  for (const x of xbrl) {
+    const key = `${x.entity_identifier}|${x.period_end}`;
+    const c = byKey.get(key);
+    if (!c) {
+      rows.push(x);
+      continue;
+    }
+    duplicates++;
+    if (used.has(key)) continue; // a second xbrl.org language edition of a report already merged
+    used.add(key);
+    if (c.has_machine_readable_report) {
+      rows.push({
+        ...c,
+        entity_name: x.entity_name ?? c.entity_name,
+        also_on_xbrl_org: { fxo_id: x.fxo_id, date_added: x.date_added, error_count: x.error_count, json_url: x.json_url },
+      });
+    } else {
+      const spec = OAM[c.source as OamId];
+      rows.push({ ...x, published_at: c.published_at, [spec.alsoOnKey]: { filing_id: c.filing_id, published_at: c.published_at } });
+    }
+  }
+  for (const c of oam) {
+    const key = `${c.entity_identifier}|${c.period_end}`;
+    if (!used.has(key) || byKey.get(key) !== c) rows.push(c);
+  }
+  return { rows, duplicates };
+}
+
+// Output form of a row: drop internal fields and undefined optionals.
+function publicRow(r: FilingRow): Omit<FilingRow, '_json_key'> {
+  const { _json_key: _ignored, ...rest } = r;
+  void _ignored;
+  return rest;
 }
 
 // Post-hoc proof the server actually narrowed the result. Cheap, and the only
@@ -945,7 +1475,9 @@ function verifyFilters(
 // left unparsed.
 function rejectUnknownArgs(args: Record<string, unknown>, accepted: readonly string[], toolLabel: string): void {
   const acceptedSet = new Set(accepted);
-  const unknown = Object.keys(args).filter((k) => !acceptedSet.has(k));
+  // `_`-prefixed keys are injected by the gateway (bindings), never
+  // typed by a caller, so they are not "arguments" in this sense.
+  const unknown = Object.keys(args).filter((k) => !k.startsWith('_') && !acceptedSet.has(k));
   if (unknown.length) {
     throw new Error(
       `user_error: ${toolLabel} does not recognise argument(s) ${unknown.map((k) => `"${k}"`).join(', ')}. ` +
@@ -957,23 +1489,54 @@ function rejectUnknownArgs(args: Record<string, unknown>, accepted: readonly str
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-// fleet #2317, Defect B: the upstream index is a voluntary community feed, not
-// a real-time filing tape. Measured live 2026-09-23 via `esef_search_filings`
-// with the `year` filter: Portugal 2023=7, 2024=7, 2025=0; Spain 2023=125,
-// 2024=113, 2025=1. Surfaced on every search response (not just README GOTCHA
-// 9) so a caller learns this from the tool, not from a query that returns zero.
-const COVERAGE_NOTE =
-  'Coverage lags the reporting period by roughly a filing season, not real time — this is a voluntary community-run index, not a live regulator feed. Measured 2026-09-23 via the `year` filter: Portugal had 7 ESEF filings for 2023, 7 for 2024, 0 for 2025; Spain had 125 for 2023, 113 for 2024, 1 for 2025. A search for the current calendar year will typically return few or no rows — that is upstream lag, not a broken query or an empty scope. Widen `year` to the prior 1-2 years, or use `period_end_from`/`period_end_to` to see the true edge of what has been indexed so far.';
+// fleet #2317 / #2379: the community index lags the reporting period by about a
+// filing season, and callers must learn that from the tool, not from a query
+// that returns zero. The note is built per response and quotes NO counts: the
+// first version froze a 2026-09-23 measurement ("Spain 2025 = 1") that the
+// CNMV merge made false the next day while the same payload said 118. Rows
+// already name their own `source`; the note says which sources backed THIS
+// search, and whether the regulator feed actually loaded.
+const INDEX_LAG =
+  'filings.xbrl.org is a voluntary community-run index, not a regulator feed: a report typically appears there weeks to months after its period closes, so its most recent period is incomplete, by an amount that varies by country and changes daily (compare the same search one `year` earlier to see the gap). A low or empty count for the current year is upstream lag, not a broken query or an empty scope. Widen `year` to the prior 1-2 years, or use `period_end_from`/`period_end_to` to find the edge of what it has indexed.';
+const INDEX_GAP: Partial<Record<OamId, string>> = {
+  newsweb: ' filings.xbrl.org stopped adding Norwegian filings in May 2025.',
+  fi: ' filings.xbrl.org stopped adding Swedish filings on 2025-05-08, so current Swedish reports come only from FI.',
+  fsma: ' filings.xbrl.org carries only part of Belgium and has added no Belgian filing since 2026-05-12.',
+};
+const OAM_EXCEPTIONS =
+  'Portugal (CMVM), Spain (CNMV), Norway (Oslo Børs NewsWeb), Sweden (Finansinspektionen) and Belgium (FSMA STORI) are also read from the national regulator, so pinning `country` to PT, ES, NO, SE or BE gets coverage that follows official publication.';
+
+function coverageNote(country: string | null | undefined, consulted: OamSpec[], loads: OamLoads | null): string {
+  const live = consulted.filter((s) => loads?.[s.id]?.ok);
+  const down = consulted.filter((s) => loads?.[s.id] && !loads[s.id]!.ok);
+  const pinned = oamForCountry(country);
+  const parts: string[] = [];
+  if (pinned && live.includes(pinned)) {
+    parts.push(
+      `${pinned.adjective} rows in this response come from ${pinned.longName} as well as filings.xbrl.org, so ${pinned.country} coverage follows official publication (typically within a day), not the community index's lag. Each row names its \`source\`; \`${pinned.statusKey}\` says how fresh the regulator index is.${INDEX_GAP[pinned.id] ?? ''}`,
+    );
+  } else {
+    if (pinned && down.includes(pinned)) {
+      parts.push(`${pinned.longName} could not be read for this search (see \`${pinned.statusKey}\`), so these ${pinned.adjective} rows come from filings.xbrl.org alone and carry its lag.${INDEX_GAP[pinned.id] ?? ''}`);
+    }
+    parts.push(INDEX_LAG);
+    if (live.length) {
+      parts.push(`This search also matched ${live.map((s) => s.longName).join(', ')}; those rows name their \`source\` and follow official publication.`);
+    }
+    if (!pinned) parts.push(OAM_EXCEPTIONS);
+  }
+  return parts.join(' ');
+}
 
 // ── tool definitions ───────────────────────────────────────────────────────
 const SCOPE_LINE =
-  'Covers 25,640 filings in two regimes: ESEF (~16,000 annual financial reports from 19 European countries — AT BE CY CZ DK ES FI FR GB GR IS IT LT NL NO PL PT RO SE) and UAIFRS (~9,600 Ukrainian IFRS filings, country UA). Pass `country` or `regime` to pin the scope you mean.';
+  'Covers 25,640 filings in two regimes: ESEF (~16,000 annual financial reports from 19 European countries — AT BE CY CZ DK ES FI FR GB GR IS IT LT NL NO PL PT RO SE) and UAIFRS (~9,600 Ukrainian IFRS filings, country UA). Pass `country` or `regime` to pin the scope you mean. Portuguese (PT), Spanish (ES) and Norwegian (NO) ESEF reports are also read directly from where each country publishes them — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway — so PT, ES and NO coverage follows official publication (typically within a day) rather than the index\'s months-long lag; each row names its `source` and those rows carry the official `published_at`. Swedish (SE) reports are likewise read from Finansinspektionen (FI), the Swedish OAM, which is the only source for Swedish FY2025 reports, and Belgian (BE) reports from the FSMA\'s STORI database, the Belgian OAM.';
 
 const tools: McpToolExport['tools'] = [
   {
     name: 'esef_search_filings',
     description:
-      'Search the XBRL International filings index (filings.xbrl.org) for published company annual reports. Answers "which European companies have filed an annual report for 2023", "does Nokia have an ESEF filing", "list Finnish filings with validation errors", "Portuguese filings with a period end after 2024-06-30". Returns per filing: company name, LEI or national identifier, country, reporting regime, period end, XBRL validation error/warning counts, report language, and direct links to the machine-readable xBRL-JSON, the inline-XBRL HTML report and the viewer. Filter by company name (substring), country (ISO-2), regime, exact period end date, calendar year, or a period_end_from/period_end_to date range. Any other argument name is rejected with a user_error rather than silently ignored. ' +
+      'Search the XBRL International filings index (filings.xbrl.org) for published company annual reports. Answers "which European companies have filed an annual report for 2023", "does Nokia have an ESEF filing", "list Finnish filings with validation errors", "Portuguese filings with a period end after 2024-06-30", "Spanish annual reports for 2025". Returns per filing: company name, LEI or national identifier, country, reporting regime, period end, source (xbrl.org, cmvm, cnmv, newsweb or fi) and official publication time where known, XBRL validation error/warning counts, report language, and direct links to the machine-readable xBRL-JSON, the inline-XBRL HTML report and the viewer. Filter by company name (substring), country (ISO-2), regime, exact period end date, calendar year, or a period_end_from/period_end_to date range. Any other argument name is rejected with a user_error rather than silently ignored. ' +
       SCOPE_LINE +
       ' Coverage of the current calendar year is sparse — the index lags the filing season; see the response `coverage_note`. Reports the index-wide match count and echoes back proof that the filters actually applied. Follow up with esef_filing_facts to get the numbers inside a filing.',
     inputSchema: {
@@ -1059,14 +1622,14 @@ const tools: McpToolExport['tools'] = [
     description:
       'Read the actual IFRS financial facts out of one published annual report — revenue, profit or loss, total assets, equity, operating cash flow, earnings per share and every other tagged figure, with the currency, the exact reporting period and the XBRL concept name. This is the numbers hop: esef_search_filings and esef_entity_filings prove a filing exists, this one opens its machine-readable xBRL-JSON report and returns what the company reported. ' +
       SCOPE_LINE +
-      ' Identify the filing by fxo_id from a search result, or just by company name plus an optional year and the latest matching English-language edition is used. Pass `concept` to pull one line item (case-insensitive substring of the IFRS concept, e.g. "Revenue", "ProfitLoss", "Assets", "Equity", "CashFlows"); omit it for a headline projection of the main statement figures. Facts repeated across statements are collapsed, consolidated totals are separated from segment and equity-component breakdowns, and the full concept inventory of the report is returned so a follow-up query can target any line item.',
+      ' Identify the filing by fxo_id from a search result (a Portuguese CMVM filing looks like "cmvm-1355933", a Spanish CNMV filing "cnmv-20912", a Norwegian NewsWeb filing "newsweb-668785-321602", a Swedish FI filing "fi-61807", a Belgian STORI filing "fsma-5c08f790-404c-4121-bd0b-0cf3350455da"), or just by company name or LEI plus an optional year and the latest matching report is used (the national copy for Portuguese, Spanish, Norwegian, Swedish and Belgian issuers, otherwise the English-language edition). Pass `concept` to pull one line item (case-insensitive substring of the IFRS concept, e.g. "Revenue", "ProfitLoss", "Assets", "Equity", "CashFlows"); omit it for a headline projection of the main statement figures. Facts repeated across statements are collapsed, consolidated totals are separated from segment and equity-component breakdowns, and the full concept inventory of the report is returned so a follow-up query can target any line item.',
     inputSchema: {
       type: 'object',
       properties: {
         fxo_id: {
           type: 'string',
           description:
-            'Filing identifier from esef_search_filings or esef_entity_filings, e.g. "549300P8N0P6KDGTJ206-2022-12-31-ESEF-FI-0". Most precise way to name a filing.',
+            'Filing identifier from esef_search_filings or esef_entity_filings, e.g. "549300P8N0P6KDGTJ206-2022-12-31-ESEF-FI-0", "cmvm-1355933" for a Portuguese filing read from CMVM, "cnmv-20912" for a Spanish filing read from CNMV, "newsweb-668785-321602" for a Norwegian filing read from Oslo Børs NewsWeb, "fi-61807" for a Swedish filing read from Finansinspektionen, or "fsma-5c08f790-404c-4121-bd0b-0cf3350455da" for a Belgian filing read from FSMA STORI. Most precise way to name a filing.',
         },
         entity: {
           type: 'string',
@@ -1177,15 +1740,98 @@ async function searchFilings(args: Record<string, unknown>) {
   }
   if (args.with_errors === true) filters.push({ name: 'error_count', op: 'gt', val: 0 });
 
-  const url = `${API}/filings${buildUrl('', { filters, pageSize: limit, pageNumber: page, sort, include: 'entity' })}`;
-  const env = await apiGet<Envelope<FilingRecord[]>>(url);
-  const names = entityIndex(env);
-  const rows = (env.data ?? []).map((rec) => {
-    const ident = relatedEntityIdentifier(rec) ?? parseFxoId(rec.attributes.fxo_id).entity_identifier;
-    return shapeFiling(rec, ident ? (names.get(ident) ?? null) : null);
-  });
+  const shapePage = (env: Envelope<FilingRecord[]>): FilingRow[] => {
+    const names = entityIndex(env);
+    return (env.data ?? []).map((rec) => {
+      const ident = relatedEntityIdentifier(rec) ?? parseFxoId(rec.attributes.fxo_id).entity_identifier;
+      return shapeFiling(rec, ident ? (names.get(ident) ?? null) : null);
+    });
+  };
 
-  const total = env.meta?.count ?? null;
+  // Portugal and Spain: also consult the national regulator (CMVM / CNMV).
+  // Taken when the caller pinned that country, or left country open and named
+  // a company the regulator has filings for. Not taken for a UAIFRS-only
+  // search or a with_errors search (regulator rows carry no validation run,
+  // so they can never satisfy error_count > 0).
+  const pinned = oamForCountry(country);
+  const oamSpecs = (!regime || regime === 'ESEF') && args.with_errors !== true
+    ? (pinned ? [pinned] : !country && entityName ? OAM_LIST : [])
+    : [];
+  const oamLoads: OamLoads | null = oamSpecs.length ? await loadAllOam(args, oamSpecs) : null;
+  const oamRows: FilingRow[] = [];
+  const oamMatches: Partial<Record<OamId, number>> = {};
+  for (const spec of oamSpecs) {
+    const load = oamLoads?.[spec.id];
+    if (!load?.ok) continue;
+    const got = oamFilings(spec, load.idx).filter((r) => {
+      if (entityName && !oamMatchesName(r, entityName)) return false;
+      const pe = r.period_end ?? '';
+      if (periodEnd) return pe === periodEnd;
+      if (periodEndFrom && pe < periodEndFrom) return false;
+      if (periodEndTo && pe > periodEndTo) return false;
+      if (!periodEndFrom && !periodEndTo && year && !pe.startsWith(String(year))) return false;
+      return true;
+    });
+    oamMatches[spec.id] = got.length;
+    oamRows.push(...got);
+  }
+  const merging = oamLoads !== null && (pinned !== null || oamRows.length > 0);
+  // A status block for each regulator actually consulted -- for a pinned
+  // country always; for an open-country name search only where it matched.
+  const shownStatus = new Set<OamId>(oamSpecs.filter((s) => pinned || (oamMatches[s.id] ?? 0) > 0).map((s) => s.id));
+  const mergedNames = OAM_LIST.filter((s) => shownStatus.has(s.id));
+
+  let url: string;
+  let rows: FilingRow[];
+  let total: number | null;
+  let mergeInfo: Record<string, unknown> | undefined;
+  if (!merging) {
+    url = `${API}/filings${buildUrl('', { filters, pageSize: limit, pageNumber: page, sort, include: 'entity' })}`;
+    const env = await apiGet<Envelope<FilingRecord[]>>(url);
+    rows = shapePage(env);
+    total = env.meta?.count ?? null;
+  } else {
+    // Merge mode pages locally: pull every xbrl.org match (Portugal and Spain
+    // are small — tens to a few hundred rows a year), merge with the
+    // regulator's rows, dedup by LEI + period end, then sort and
+    // slice. Capped so a broad name search cannot fan out without bound.
+    const MAX_PAGES = 5;
+    const xbrl: FilingRow[] = [];
+    let xbrlTotal: number | null = null;
+    url = `${API}/filings${buildUrl('', { filters, pageSize: 100, pageNumber: 1, sort, include: 'entity' })}`;
+    for (let p = 1; p <= MAX_PAGES; p++) {
+      const pu = `${API}/filings${buildUrl('', { filters, pageSize: 100, pageNumber: p, sort, include: 'entity' })}`;
+      const env = await apiGet<Envelope<FilingRecord[]>>(pu);
+      const got = shapePage(env);
+      xbrlTotal = env.meta?.count ?? xbrlTotal;
+      xbrl.push(...got);
+      if (got.length < 100 || (xbrlTotal != null && xbrl.length >= xbrlTotal)) break;
+    }
+    const merged = mergeRows(xbrl, oamRows);
+    const when = (r: FilingRow) => r.published_at ?? r.date_added ?? '';
+    const cmp: Record<string, (a: FilingRow, b: FilingRow) => number> = {
+      newest: (a, b) => when(b).localeCompare(when(a)),
+      oldest: (a, b) => when(a).localeCompare(when(b)),
+      period_desc: (a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? '') || when(b).localeCompare(when(a)),
+      period_asc: (a, b) => (a.period_end ?? '').localeCompare(b.period_end ?? '') || when(a).localeCompare(when(b)),
+    };
+    merged.rows.sort(cmp[sortKey] ?? cmp.newest);
+    total = merged.rows.length;
+    rows = merged.rows.slice((page - 1) * limit, page * limit);
+    mergeInfo = {
+      xbrl_org_matches: xbrlTotal,
+      xbrl_org_rows_read: xbrl.length,
+      ...(oamMatches.cmvm != null ? { cmvm_matches: oamMatches.cmvm } : {}),
+      ...(oamMatches.cnmv != null ? { cnmv_matches: oamMatches.cnmv } : {}),
+      ...(oamMatches.newsweb != null ? { newsweb_matches: oamMatches.newsweb } : {}),
+      ...(oamMatches.fi != null ? { fi_matches: oamMatches.fi } : {}),
+      ...(oamMatches.fsma != null ? { fsma_matches: oamMatches.fsma } : {}),
+      duplicates_collapsed: merged.duplicates,
+      merge_complete: xbrlTotal == null || xbrl.length >= xbrlTotal,
+      note: "Portuguese, Spanish, Norwegian, Swedish and Belgian results combine filings.xbrl.org with the country's official publication channel — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway, Finansinspektionen (FI) for Sweden, FSMA STORI for Belgium. A report on both appears once (matched by LEI and period end); `source` says which copy the row describes and `also_on_xbrl_org` / `also_on_cmvm` / `also_on_cnmv` / `also_on_newsweb` / `also_on_fi` / `also_on_fsma` names the other. `published_at` is the regulator's official publication time (CNMV: to the minute where its disclosure feed carries the filing, else the day; NewsWeb: the announcement time, UTC; FI: to the minute, Stockholm offset; STORI: the issuer's publication time, Brussels offset, with STORI's own receipt time as `received_at`); xbrl.org rows only carry `date_added`, the day that index picked the report up. A Spanish issuer that files individual and consolidated accounts in one package gets one row each, labelled by `report_scope`.",
+    };
+  }
+
   const check = verifyFilters(rows, {
     country,
     regime,
@@ -1212,8 +1858,9 @@ async function searchFilings(args: Record<string, unknown>) {
         'No filing in the index matches those criteria. Widen the search: drop `year`/`period_end_from`/`period_end_to` (the index runs from roughly 2020 period-ends onward, lags the reporting period by a filing season, and a report appears months after the period closes — see coverage_note), shorten `entity_name` to a distinctive fragment of the legal name (try "Citycon" rather than "Citycon Oyj Plc"), or drop `country` — a group can file in a jurisdiction other than the one you expect.',
       total_matching: total,
       filters_requested: filtersRequested,
-      coverage_note: COVERAGE_NOTE,
-      source: 'filings.xbrl.org',
+      coverage_note: coverageNote(country, oamSpecs, oamLoads),
+      ...oamStatuses(oamLoads, pinned ? undefined : shownStatus),
+      source: merging && mergedNames.length ? `filings.xbrl.org + ${mergedNames.map((s) => s.id.toUpperCase()).join(' + ')}` : 'filings.xbrl.org',
     };
   }
 
@@ -1234,9 +1881,13 @@ async function searchFilings(args: Record<string, unknown>) {
     filter_mismatches: check.mismatches,
     scope_note:
       'This index carries both ESEF (European annual financial reports) and UAIFRS (Ukrainian IFRS) filings. Each row states its own country and regime.',
-    coverage_note: COVERAGE_NOTE,
-    filings: rows,
-    source: 'filings.xbrl.org (XBRL International filings index)',
+    coverage_note: coverageNote(country, oamSpecs, oamLoads),
+    ...(mergeInfo ? { merge: mergeInfo } : {}),
+    ...oamStatuses(oamLoads, pinned ? undefined : shownStatus),
+    filings: rows.map(publicRow),
+    source: merging && mergedNames.length
+      ? `filings.xbrl.org (XBRL International filings index) + ${mergedNames.map((s) => s.longName).join(' + ')}`
+      : 'filings.xbrl.org (XBRL International filings index)',
     query_url: url,
   };
 }
@@ -1252,7 +1903,7 @@ async function searchFilings(args: Record<string, unknown>) {
 interface Resolved {
   identifier: string;
   name: string;
-  match: 'identifier' | 'exact_name' | 'prefix_name' | 'contains_name';
+  match: 'identifier' | 'exact_name' | 'prefix_name' | 'contains_name' | `${OamId}_identifier` | `${OamId}_name`;
   candidates?: Array<{ identifier: string; name: string }>;
 }
 
@@ -1307,6 +1958,83 @@ async function resolveEntity(input: string): Promise<Resolved | { found: false; 
   };
 }
 
+// Resolve on filings.xbrl.org, then attach the entity's regulator filings
+// (CMVM Portugal, CNMV Spain) by LEI. An issuer that filings.xbrl.org has never
+// indexed is resolved from a regulator index alone, by LEI, NIF or name.
+const fromOamOnly = (m: Resolved['match']) => OAM_LIST.some((s) => m.startsWith(`${s.id}_`));
+
+async function resolveWithOam(
+  input: string,
+  args: Record<string, unknown>,
+): Promise<{
+  resolved: Resolved | { found: false; reason: string; hint: string; query: string };
+  oamLoads: OamLoads;
+  oamRows: FilingRow[];
+  allOam: FilingRow[];
+}> {
+  const [resolved, oamLoads] = await Promise.all([resolveEntity(input), loadAllOam(args)]);
+  const all: FilingRow[] = [];
+  for (const spec of OAM_LIST) {
+    const l = oamLoads[spec.id];
+    if (l?.ok) all.push(...oamFilings(spec, l.idx));
+  }
+  if (!('found' in resolved)) {
+    return { resolved, oamLoads, oamRows: all.filter((r) => r.entity_identifier === resolved.identifier), allOam: all };
+  }
+  const q = input.trim();
+  const byLei = all.filter((r) => (r.entity_identifier ?? '').toUpperCase() === q.toUpperCase());
+  const hits = byLei.length ? byLei : all.filter((r) => oamMatchesName(r, q));
+  const best = [...hits].sort((a, b) => (a.entity_name ?? '').length - (b.entity_name ?? '').length)[0];
+  const lei = best?.entity_identifier;
+  if (!lei || !best) return { resolved, oamLoads, oamRows: [], allOam: all };
+  const rows = all.filter((r) => r.entity_identifier === lei);
+  const name = rows.sort((a, b) => (b.published_at ?? '').localeCompare(a.published_at ?? ''))[0]?.entity_name ?? q;
+  const src: OamId = best.source === 'xbrl.org' ? 'cmvm' : best.source;
+  return {
+    resolved: { identifier: lei, name, match: byLei.length ? `${src}_identifier` : `${src}_name` },
+    oamLoads,
+    oamRows: rows,
+    allOam: all,
+  };
+}
+
+// A NAME can pick the wrong issuer: "Ericsson" matches ERICSSON NIKOLA TESLA
+// d.d. (Croatia) on filings.xbrl.org before Telefonaktiebolaget LM Ericsson,
+// whose FY2025 is only in the FI index (fleet #2372). When the name-picked
+// issuer has nothing for the requested year, look for OTHER issuers in the
+// regulator indexes whose name matches and who do have that year. One issuer
+// -> use it; several -> the caller chooses, we never guess.
+function oamYearFallback(
+  all: FilingRow[],
+  q: string,
+  year: number,
+): { issuers: Array<{ name: string | null; country: string | null; lei: string | null; source: string; filing_id: string }>; rows: FilingRow[] } {
+  const hits = all.filter((r) => (r.period_end ?? '').startsWith(String(year)) && oamMatchesName(r, q));
+  const byIssuer = new Map<string, FilingRow[]>();
+  for (const r of hits) {
+    const key = r.entity_identifier ?? `id|${r.filing_id}`;
+    const g = byIssuer.get(key);
+    if (g) g.push(r);
+    else byIssuer.set(key, [r]);
+  }
+  const issuers = [...byIssuer.values()].map((g) => {
+    const r = g[0] as FilingRow;
+    return { name: r.entity_name, country: r.country, lei: r.entity_identifier, source: r.source, filing_id: r.filing_id };
+  });
+  return { issuers, rows: byIssuer.size === 1 ? hits : [] };
+}
+
+/** Status blocks for the regulators whose countries these rows touch. */
+function statusesForRows(loads: OamLoads, rows: FilingRow[]): Record<string, unknown> {
+  const touched = new Set<OamId>();
+  for (const r of rows) {
+    if (r.source !== 'xbrl.org') touched.add(r.source);
+    const spec = oamForCountry(r.country);
+    if (spec) touched.add(spec.id);
+  }
+  return oamStatuses(loads, touched);
+}
+
 // ── esef_entity_filings ────────────────────────────────────────────────────
 async function entityFilings(args: Record<string, unknown>) {
   const input = str(args.entity) ?? str(args.company) ?? str(args.name) ?? str(args.lei) ?? str(args.identifier);
@@ -1319,15 +2047,23 @@ async function entityFilings(args: Record<string, unknown>) {
   }
   const limit = clampInt(args.limit, 50, 1, 100);
 
-  const resolved = await resolveEntity(input);
+  const { resolved, oamLoads, oamRows } = await resolveWithOam(input, args);
   if ('found' in resolved) return resolved;
 
   const url = `${API}/entities/${encodeURIComponent(resolved.identifier)}/filings${buildUrl('', {
     pageSize: limit,
     sort: '-period_end',
   })}`;
-  const env = await apiGet<Envelope<FilingRecord[]>>(url);
-  const rows = (env.data ?? []).map((rec) => shapeFiling(rec, resolved.name));
+  const oamOnly = fromOamOnly(resolved.match);
+  const xbrlRows = oamOnly
+    ? []
+    : ((await apiGet<Envelope<FilingRecord[]>>(url)).data ?? []).map((rec) => shapeFiling(rec, resolved.name));
+  // One row per report per source: regulator rows join xbrl.org rows here and
+  // are grouped with them by period below, so a report on both is one `report`.
+  const rows: FilingRow[] = [...xbrlRows, ...oamRows]
+    .sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''))
+    .slice(0, limit);
+  const statusBlocks = statusesForRows(oamLoads, [...xbrlRows, ...oamRows]);
 
   if (!rows.length) {
     return {
@@ -1354,7 +2090,12 @@ async function entityFilings(args: Record<string, unknown>) {
   }
   const reports = [...groups.values()]
     .map((g) => {
+      // A regulator copy (CMVM/CNMV) with a machine-readable report is
+      // preferred for the same reason as in search: it is the regulator's own
+      // package. Consolidated before individual where both exist.
       const preferred =
+        g.editions.find((e) => e.source !== 'xbrl.org' && e.has_machine_readable_report && e.report_scope !== 'individual') ??
+        g.editions.find((e) => e.source !== 'xbrl.org' && e.has_machine_readable_report) ??
         g.editions.find((e) => e.language === 'en' && e.has_machine_readable_report) ??
         g.editions.find((e) => e.has_machine_readable_report) ??
         g.editions[0];
@@ -1364,7 +2105,8 @@ async function entityFilings(args: Record<string, unknown>) {
         regime: g.regime,
         languages: g.editions.map((e) => e.language).filter((l): l is string => Boolean(l)),
         edition_count: g.editions.length,
-        preferred_edition: preferred,
+        sources: [...new Set(g.editions.map((e) => e.source))],
+        preferred_edition: preferred ? publicRow(preferred) : preferred,
       };
     })
     .sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''));
@@ -1380,11 +2122,14 @@ async function entityFilings(args: Record<string, unknown>) {
     filing_count: rows.length,
     report_count: reports.length,
     dedup_note:
-      'filing_count counts index rows; report_count counts distinct financial years, since one annual report is often indexed once per language edition with identical figures.',
+      'filing_count counts index rows; report_count counts distinct financial years, since one annual report is often indexed once per language edition with identical figures. For Portuguese, Spanish and Norwegian issuers a report can also appear once from filings.xbrl.org and once from the national source (CMVM, CNMV, Oslo Børs NewsWeb); both sit in the same `reports` entry and `sources` lists them.',
     reports,
-    filings: rows,
-    source: 'filings.xbrl.org (XBRL International filings index)',
-    query_url: url,
+    filings: rows.map(publicRow),
+    ...statusBlocks,
+    source: oamRows.length
+      ? `filings.xbrl.org (XBRL International filings index) + ${OAM_LIST.filter((s) => oamRows.some((r) => r.source === s.id)).map((s) => s.longName).join(' + ')}`
+      : 'filings.xbrl.org (XBRL International filings index)',
+    query_url: oamOnly ? null : url,
   };
 }
 
@@ -1524,7 +2269,7 @@ function shapeFact(f: XbrlFact): ShapedFact {
     concept_short: localName(concept),
     value: isLongText ? `${(raw as string).slice(0, MAX_TEXT_VALUE)}…` : raw,
     value_number: num,
-    ...(isLongText ? { value_truncated: true, value_length: (raw as string).length } : {}),
+    ...(isLongText ? { value_truncated: true, value_length: f._fullLength ?? (raw as string).length } : {}),
     unit,
     // Only a plain iso4217:XXX unit is a currency. Per-share units come
     // through as "iso4217:EUR/xbrli:shares" — that is EUR per share, not a
@@ -1539,10 +2284,31 @@ function shapeFact(f: XbrlFact): ShapedFact {
 }
 
 async function resolveFilingForFacts(args: Record<string, unknown>): Promise<
-  | { ok: true; filing: ReturnType<typeof shapeFiling>; how: string }
+  | { ok: true; filing: FilingRow; how: string; oamLoads: OamLoads | null }
   | { ok: false; payload: Record<string, unknown> }
 > {
   const fxoId = str(args.fxo_id) ?? str(args.filing_id) ?? str(args.filing);
+  const idSpec = fxoId ? oamForId(fxoId) : null;
+  if (fxoId && idSpec) {
+    const load = await loadOam(idSpec, args);
+    const row = load.ok ? findOamById(idSpec, load.idx, fxoId.toLowerCase()) : null;
+    const short = idSpec.id.toUpperCase();
+    if (!row) {
+      return {
+        ok: false,
+        payload: {
+          found: false,
+          reason: load.ok ? 'filing_not_found' : `${idSpec.id}_unavailable`,
+          hint: load.ok
+            ? `No ${short} filing "${fxoId}". Get a current id from esef_search_filings with country "${idSpec.country}", or call this tool with \`entity\` and \`year\`.`
+            : `"${fxoId}" is a ${short} filing id, and ${short} could not be consulted from this process. Call this tool with \`entity\` and \`year\` to fall back to filings.xbrl.org.`,
+          fxo_id: fxoId,
+          [idSpec.statusKey]: oamStatus(idSpec, load),
+        },
+      };
+    }
+    return { ok: true, filing: row, how: `${short} filing ${row.filing_id}`, oamLoads: { [idSpec.id]: load } };
+  }
   if (fxoId) {
     const url = `${API}/filings${buildUrl('', {
       filters: [{ name: 'fxo_id', op: 'eq', val: fxoId }],
@@ -1557,14 +2323,14 @@ async function resolveFilingForFacts(args: Record<string, unknown>): Promise<
         payload: {
           found: false,
           reason: 'filing_not_found',
-          hint: `No filing with fxo_id "${fxoId}". fxo_id looks like "549300P8N0P6KDGTJ206-2022-12-31-ESEF-FI-0" — identifier, period end, regime, country, sequence. Get an exact one from esef_search_filings or esef_entity_filings, or call this tool with \`entity\` and \`year\` instead.`,
+          hint: `No filing with fxo_id "${fxoId}". fxo_id looks like "549300P8N0P6KDGTJ206-2022-12-31-ESEF-FI-0" — identifier, period end, regime, country, sequence — or "cmvm-1355933" / "cnmv-20912" / "newsweb-668785-321602" / "fi-61807" / "fsma-5c08f790-404c-4121-bd0b-0cf3350455da" for a Portuguese / Spanish / Norwegian / Swedish / Belgian filing read from CMVM / CNMV / Oslo Børs NewsWeb / FI / FSMA STORI. Get an exact one from esef_search_filings or esef_entity_filings, or call this tool with \`entity\` and \`year\` instead.`,
           fxo_id: fxoId,
         },
       };
     }
     const ident = relatedEntityIdentifier(rec) ?? parseFxoId(rec.attributes.fxo_id).entity_identifier;
     const name = ident ? (entityIndex(env).get(ident) ?? null) : null;
-    return { ok: true, filing: shapeFiling(rec, name), how: `fxo_id ${fxoId}` };
+    return { ok: true, filing: shapeFiling(rec, name), how: `fxo_id ${fxoId}`, oamLoads: null };
   }
 
   const entity = str(args.entity) ?? str(args.company) ?? str(args.name) ?? str(args.lei);
@@ -1579,16 +2345,45 @@ async function resolveFilingForFacts(args: Record<string, unknown>): Promise<
     };
   }
   const year = args.year != null ? clampInt(args.year, 0, 1990, 2100) : undefined;
-  const resolved = await resolveEntity(entity);
-  if ('found' in resolved) return { ok: false, payload: resolved as unknown as Record<string, unknown> };
+  const { resolved: resolved0, oamLoads, oamRows, allOam } = await resolveWithOam(entity, args);
+  if ('found' in resolved0) return { ok: false, payload: resolved0 as unknown as Record<string, unknown> };
+  let resolved: Resolved = resolved0;
 
+  const oamOnly = fromOamOnly(resolved.match);
   const url = `${API}/entities/${encodeURIComponent(resolved.identifier)}/filings${buildUrl('', {
     pageSize: 100,
     sort: '-period_end',
   })}`;
-  const env = await apiGet<Envelope<FilingRecord[]>>(url);
-  let rows = (env.data ?? []).map((rec) => shapeFiling(rec, resolved.name));
+  const xbrlRows = oamOnly
+    ? []
+    : ((await apiGet<Envelope<FilingRecord[]>>(url)).data ?? []).map((rec) => shapeFiling(rec, resolved.name));
+  let rows: FilingRow[] = [...xbrlRows, ...oamRows];
   if (year) rows = rows.filter((r) => (r.period_end ?? '').startsWith(String(year)));
+  let fallbackNote = '';
+  const byName = !(resolved.match === 'identifier' || resolved.match.endsWith('_identifier'));
+  if (!rows.length && year && byName) {
+    const fb = oamYearFallback(allOam, entity, year);
+    if (fb.issuers.length > 1) {
+      return {
+        ok: false,
+        payload: {
+          found: false,
+          reason: 'ambiguous_entity',
+          hint: `"${entity}" matched "${resolved.name}" on filings.xbrl.org, which has no filing with a period ending in ${year}, and ${fb.issuers.length} other issuers in the national regulator indexes whose names match do. Call again with the \`lei\` of the one you mean (or its filing_id as \`fxo_id\`).`,
+          name_matched_on_xbrl_org: { identifier: resolved.identifier, name: resolved.name, match: resolved.match },
+          candidates: fb.issuers,
+          ...statusesForRows(oamLoads, allOam.filter((r) => fb.issuers.some((i) => i.filing_id === r.filing_id))),
+        },
+      };
+    }
+    if (fb.issuers.length === 1 && fb.rows[0]) {
+      const r0 = fb.rows[0];
+      fallbackNote = ` (the name first matched "${resolved.name}" on filings.xbrl.org, which has no ${year} filing; resolved instead to the only issuer in the ${r0.source.toUpperCase()} index whose name matches and who has one)`;
+      resolved = { identifier: r0.entity_identifier ?? r0.filing_id, name: r0.entity_name ?? entity, match: `${r0.source as OamId}_name` };
+      rows = fb.rows;
+    }
+  }
+  const statusBlocks = statusesForRows(oamLoads, [...xbrlRows, ...oamRows, ...(fallbackNote ? rows : [])]);
   if (!rows.length) {
     return {
       ok: false,
@@ -1599,19 +2394,32 @@ async function resolveFilingForFacts(args: Record<string, unknown>): Promise<
           ? `"${resolved.name}" has no filing with a period ending in ${year}. Call esef_entity_filings for "${resolved.name}" to see which years are published.`
           : `"${resolved.name}" resolved but has no filings attached in the index.`,
         resolved_to: { identifier: resolved.identifier, name: resolved.name, match: resolved.match },
+        ...statusBlocks,
       },
     };
   }
-  // Language editions carry identical numbers; take the English one when it is
-  // there so the concept labels and any narrative text are readable.
+  // Most recent period with a machine-readable report wins. Within that
+  // period: the regulator's copy (CMVM/CNMV, consolidated before individual),
+  // else the English edition
+  // — language editions carry identical numbers, and English keeps concept
+  // labels and narrative text readable.
   const withReport = rows.filter((r) => r.has_machine_readable_report);
-  const pool = withReport.length ? withReport : rows;
-  const picked = pool.find((r) => r.language === 'en') ?? pool[0];
-  const chosen = picked as ReturnType<typeof shapeFiling>;
+  const pool0 = withReport.length ? withReport : rows;
+  const latest = pool0.reduce((m, r) => ((r.period_end ?? '') > m ? (r.period_end ?? '') : m), '');
+  const pool = pool0.filter((r) => (r.period_end ?? '') === latest);
+  const chosen = (pool.find((r) => r.source !== 'xbrl.org' && r.report_scope !== 'individual') ??
+    pool.find((r) => r.source !== 'xbrl.org') ??
+    pool.find((r) => r.language === 'en') ??
+    pool[0]) as FilingRow;
   return {
     ok: true,
     filing: chosen,
-    how: `entity "${resolved.name}" (${resolved.identifier})${year ? `, period ending in ${year}` : ', most recent period'}, ${chosen.language ?? 'default'}-language edition of ${pool.length} edition(s)`,
+    how: `entity "${resolved.name}" (${resolved.identifier})${year ? `, period ending in ${year}` : ', most recent period'}, ${chosen.source !== 'xbrl.org' ? `${chosen.source.toUpperCase()} copy${chosen.report_scope ? ` (${chosen.report_scope})` : ''}` : `${chosen.language ?? 'default'}-language edition`} of ${pool.length} candidate(s) for ${latest || 'that period'}${fallbackNote}`,
+    // Only the regulators these rows touch, so a Spanish answer carries
+    // cnmv_status and a Portuguese one cmvm_status, never both.
+    oamLoads: Object.keys(statusBlocks).length
+      ? Object.fromEntries(OAM_LIST.filter((sp) => sp.statusKey in statusBlocks).map((sp) => [sp.id, oamLoads[sp.id]]))
+      : null,
   };
 }
 
@@ -1624,7 +2432,19 @@ async function filingFacts(args: Record<string, unknown>) {
   if (!resolution.ok) return resolution.payload;
   const filing = resolution.filing;
 
-  if (!filing.json_url) {
+  if (filing.source !== 'xbrl.org') {
+    const spec = OAM[filing.source];
+    const short = spec.id.toUpperCase();
+    if (!filing._json_key) {
+      return {
+        found: false,
+        reason: 'no_machine_readable_report',
+        hint: `${short} filing ${filing.fxo_id} was published as an ESEF package, but it holds no readable inline XBRL (seen on packages that contain a plain, untagged XHTML file — typically individual accounts). ${filing.viewer_url ? `${short}'s page for it: ${filing.viewer_url}.` : ''} Another ${short} version or the filings.xbrl.org edition may have figures — see esef_entity_filings.`,
+        filing: publicRow(filing),
+        [spec.statusKey]: oamStatus(spec, resolution.oamLoads?.[spec.id] ?? { ok: false, reason: `${spec.id}_not_consulted` }),
+      };
+    }
+  } else if (!filing.json_url) {
     // ~1.5% of index rows are metadata-only. In the sampled cases report_url
     // and viewer_url were null too, so name whatever survived rather than
     // promising an HTML fallback that is not there either.
@@ -1635,12 +2455,22 @@ async function filingFacts(args: Record<string, unknown>) {
       hint: alt
         ? `Filing ${filing.fxo_id} has no xBRL-JSON report, so its figures cannot be read as data. The human-readable report is at ${alt}.`
         : `Filing ${filing.fxo_id} is an index entry only — no xBRL-JSON, HTML report, viewer or package file was published for it, so there are no figures to read. Roughly 1.5% of the index is like this. Try another period or language edition for this company via esef_entity_filings.`,
-      filing,
+      filing: publicRow(filing),
       alternate_url: alt,
     };
   }
 
-  const doc = await reportGet(filing.json_url);
+  let doc: XbrlJsonDoc;
+  if (filing.source !== 'xbrl.org') {
+    const r2 = r2From(args);
+    const obj = r2 ? await r2.get(filing._json_key as string) : null;
+    if (!obj) {
+      throw new Error(`${filing.source.toUpperCase()} report for ${filing.fxo_id} is listed but could not be loaded. Retry, or use the filings.xbrl.org edition via esef_entity_filings.`);
+    }
+    doc = JSON.parse(await obj.text()) as XbrlJsonDoc;
+  } else {
+    doc = await reportGet(filing.json_url as string);
+  }
   const facts = doc.facts ?? {};
   const allEntries = Object.values(facts);
   const totalFacts = allEntries.length;
@@ -1649,7 +2479,7 @@ async function filingFacts(args: Record<string, unknown>) {
       found: false,
       reason: 'empty_report',
       hint: `The xBRL-JSON report for ${filing.fxo_id} loaded but declares no facts. Try another language edition or period for this company via esef_entity_filings.`,
-      filing,
+      filing: publicRow(filing),
     };
   }
 
@@ -1702,7 +2532,7 @@ async function filingFacts(args: Record<string, unknown>) {
       hint: conceptFilter
         ? `The report for ${filing.fxo_id} tags no concept containing "${conceptFilter}". IFRS concept names are specific — try a broader fragment ("Profit" rather than "NetProfit", "Cash" rather than "CashOnHand"), set include_dimensioned true if you want segment breakdowns, or drop \`concept\` to see the headline figures and the full concept inventory.`
         : `No consolidated facts survived filtering in ${filing.fxo_id}. Set include_dimensioned true to include axis-broken-down facts.`,
-      filing,
+      filing: publicRow(filing),
       total_facts_in_report: totalFacts,
       concept_count: conceptCounts.size,
       available_concepts: [...conceptCounts.keys()].sort().slice(0, CONCEPT_INVENTORY_CAP),
@@ -1797,6 +2627,18 @@ async function filingFacts(args: Record<string, unknown>) {
       json_url: filing.json_url,
       report_url: filing.report_url,
       viewer_url: filing.viewer_url,
+      source: filing.source,
+      published_at: filing.published_at,
+      ...(filing.source !== 'xbrl.org'
+        ? {
+            ...(filing.report_scope ? { report_scope: filing.report_scope } : {}),
+            first_published_at: filing.first_published_at ?? null,
+            indexed_at: filing.indexed_at ?? null,
+            title: filing.title ?? null,
+            package_sha256: filing.package_sha256 ?? null,
+            source_url: filing.source_url ?? null,
+          }
+        : {}),
     },
     resolved_by: resolution.how,
     document_language: docLanguage,
@@ -1825,7 +2667,11 @@ async function filingFacts(args: Record<string, unknown>) {
     facts: facts_out,
     concept_count: conceptCounts.size,
     available_concepts: [...conceptCounts.keys()].sort().slice(0, CONCEPT_INVENTORY_CAP),
-    source: `filings.xbrl.org — xBRL-JSON report ${filing.json_url}`,
+    ...oamStatuses(resolution.oamLoads),
+    source:
+      filing.source !== 'xbrl.org'
+        ? `${OAM[filing.source].longName} — ESEF package ${filing.fxo_id}, published ${filing.published_at}`
+        : `filings.xbrl.org — xBRL-JSON report ${filing.json_url}`,
   };
 }
 

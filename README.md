@@ -156,7 +156,7 @@ So Swedish filings also come from FI, with the same merge, dedup by LEI + period
 
 Name resolution runs on filings.xbrl.org first, and the shortest matching name wins. `"Ericsson"` matches **ERICSSON NIKOLA TESLA d.d.** (Croatia) there, and Telefonaktiebolaget LM Ericsson's FY2025 is only in the FI index — so `esef_filing_facts {entity:"Ericsson", year:2025}` used to answer a confident `no_filing_for_year` (fleet #2372).
 
-When `esef_filing_facts` resolves by name and the picked issuer has no filing for the requested `year`, it now searches the regulator indexes (CMVM, CNMV, NewsWeb, FI, FSMA STORI) for other issuers whose name matches and who do:
+When `esef_filing_facts` resolves by name and the picked issuer has no filing for the requested `year`, it now searches the regulator indexes (CMVM, CNMV, NewsWeb, FI, FSMA STORI, MSE) for other issuers whose name matches and who do:
 
 - exactly one → that issuer's report is used, and `resolved_by` says the name first matched someone else;
 - more than one → `reason: "ambiguous_entity"` with `candidates` (name, country, LEI, source, filing_id); the tool never guesses.
@@ -175,6 +175,18 @@ Same merge, dedup by LEI + period end, and freshness contract as GOTCHA 10-13:
 - Publications with no inline XBRL (PDF only: certificates, funds, some non-EU issuers) have no row; the index lists them under `publications_without_inline_xbrl`.
 - The LEI comes from the inline XBRL, then the package root folder, then STORI's listing — never from the file name (`abinbev-2023-12-31-en (1).zip`).
 
+### GOTCHA 16 — Malta comes only from the Malta Stock Exchange OAM for FY2025
+
+filings.xbrl.org **stopped ingesting Malta on 2025-05-21**: MT FY2024 = 46 filings, FY2025 = 0. The Malta Stock Exchange runs Malta's officially appointed mechanism, and every annual-report announcement there links the issuer's ESEF ZIP: 97 FY2025 packages from 92 issuers in the last 12 months, measured 2026-09-25 (survey: `docs/esef-freshness-survey.md` Part 9, fleet #2431).
+
+Same merge, dedup by LEI + period end, and freshness contract as GOTCHA 10-15:
+
+- `source` is `mse`; the other copy is `also_on_xbrl_org` / `also_on_mse`. Every response that consulted it carries **`mse_status`** (same fields as `cmvm_status`).
+- MSE filing ids are the CDN folder name, which spells out symbol, period end, scope, LEI and upload time: `mse-BOV_20251231_CON_AFR_529900RWC8ZYB066JF16_20260326114707204` (Bank of Valletta FY2025). `published_at` is the OAM announcement time (Malta offset).
+- Most Maltese issuers are bond-issuing finance companies that file company-only accounts: 41 of the 97 FY2025 packages are `IND` (`report_scope: "individual"`), the other 56 `CON` (`"consolidated"`). ESEF only requires tagging for consolidated IFRS statements, and every `IND` package measured is a plain untagged XHTML: those rows are listed with `has_machine_readable_report: false`, and `esef_filing_facts` has no figures for them.
+- Non-December year ends are common (MaltaPost 30 Sep, Farsons 31 Jan). `year` filters on the period end, as everywhere in this pack.
+- The exchange's terms let anyone save and reproduce the files provided "the source is to be stated and the material not altered or distorted": rows name the source, packages are stored as downloaded.
+
 ## Data sources
 
 - Index: `https://filings.xbrl.org/api/filings` (JSON:API, header `Accept: application/vnd.api+json`)
@@ -185,6 +197,7 @@ Same merge, dedup by LEI + period end, and freshness contract as GOTCHA 10-13:
 - Norway: Oslo Børs NewsWeb annual-report announcements (`https://api3.oslo.oslobors.no/v1/newsreader/list?category=1001`, keyless), ESEF packages as attached by each issuer, converted the same way (`scripts/esef-cmvm/collect_newsweb.py`)
 - Sweden: Finansinspektionen Börsinformation (`https://finanscentralen.fi.se/search/SearchByRegistrationDate.aspx`, file `GetFile.aspx?fid=<N>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_fi.py`)
 - Belgium: FSMA STORI (`https://webapi.fsma.be/api/v1/en/stori/result`, keyless JSON; file `…/stori/download?fileDataId=<uuid>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_fsma.py`)
+- Malta: the Malta Stock Exchange's Officially Appointed Mechanism (named, not linked: the exchange's terms prohibit linking to its site without written permission), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_mse.py`). Maltese rows carry no `source_url` / `viewer_url` for the same reason.
 
 ## Quick Start
 

@@ -1054,6 +1054,7 @@ interface FilingRow {
   also_on_newsweb?: OamRef;
   also_on_fi?: OamRef;
   also_on_fsma?: OamRef;
+  also_on_mse?: OamRef;
   also_on_xbrl_org?: XbrlOrgRef;
   /** internal: dataset key of the xBRL-JSON for a regulator (CMVM/CNMV) row; stripped before output */
   _json_key?: string | null;
@@ -1119,21 +1120,24 @@ interface R2Bucketish {
   get(key: string): Promise<{ text(): Promise<string> } | null>;
 }
 
-type OamId = 'cmvm' | 'cnmv' | 'newsweb' | 'fi' | 'fsma';
+type OamId = 'cmvm' | 'cnmv' | 'newsweb' | 'fi' | 'fsma' | 'mse';
 
 interface OamSpec {
   id: OamId;
-  country: 'PT' | 'ES' | 'NO' | 'SE' | 'BE';
+  country: 'PT' | 'ES' | 'NO' | 'SE' | 'BE' | 'MT';
   indexKey: string;
   /** e.g. "CMVM (Comissão do Mercado de Valores Mobiliários, Portugal)" */
   longName: string;
   adjective: string;
-  statusKey: 'cmvm_status' | 'cnmv_status' | 'newsweb_status' | 'fi_status' | 'fsma_status';
-  alsoOnKey: 'also_on_cmvm' | 'also_on_cnmv' | 'also_on_newsweb' | 'also_on_fi' | 'also_on_fsma';
+  statusKey: 'cmvm_status' | 'cnmv_status' | 'newsweb_status' | 'fi_status' | 'fsma_status' | 'mse_status';
+  alsoOnKey: 'also_on_cmvm' | 'also_on_cnmv' | 'also_on_newsweb' | 'also_on_fi' | 'also_on_fsma' | 'also_on_mse';
   idRe: RegExp;
   /** True only when .github/workflows/esef-cmvm-refresh.yml refreshes this
    *  index every day. The stale note says "(expected daily)" only then (#2373). */
   scheduledDaily: boolean;
+  /** True when the source's terms forbid linking to its site: rows then carry
+   *  no source_url / viewer_url, only the source's name (MSE, #2431). */
+  noLinks?: boolean;
 }
 
 const OAM: Record<OamId, OamSpec> = {
@@ -1204,8 +1208,29 @@ const OAM: Record<OamId, OamSpec> = {
     // Daily in .github/workflows/esef-cmvm-refresh.yml (14-day window; #2405).
     scheduledDaily: true,
   },
+  // Malta (#2431): the Malta Stock Exchange's Officially Appointed Mechanism,
+  // whose annual-report announcements link each issuer's ESEF ZIP on the
+  // exchange's CDN. filings.xbrl.org stopped ingesting MT on 2025-05-21
+  // (FY2025 = 0), so current Maltese reports come only from here. Written by
+  // scripts/esef-cmvm/collect_mse.py; filing ids are the CDN folder name
+  // (<symbol>_<period end>_<scope>_<type>_<LEI>_<upload stamp>).
+  mse: {
+    id: 'mse',
+    country: 'MT',
+    indexKey: 'esef-mse/index.json',
+    longName: 'Malta Stock Exchange OAM (Malta)',
+    adjective: 'Maltese',
+    statusKey: 'mse_status',
+    alsoOnKey: 'also_on_mse',
+    idRe: /^mse-[a-z0-9]+_\d{8}_[a-z]+_[a-z]+_[a-z0-9]{20}_\d{14,17}$/i,
+    // Daily in .github/workflows/esef-cmvm-refresh.yml (the unfiltered OAM page; #2431).
+    scheduledDaily: true,
+    // The MSE's terms prohibit "Linking of the Website to any other site or
+    // in a networked computer environment" without written permission.
+    noLinks: true,
+  },
 };
-const OAM_LIST: OamSpec[] = [OAM.cmvm, OAM.cnmv, OAM.newsweb, OAM.fi, OAM.fsma];
+const OAM_LIST: OamSpec[] = [OAM.cmvm, OAM.cnmv, OAM.newsweb, OAM.fi, OAM.fsma, OAM.mse];
 
 function oamForId(filingId: string): OamSpec | null {
   return OAM_LIST.find((s) => s.idRe.test(filingId)) ?? null;
@@ -1385,11 +1410,11 @@ function shapeOam(spec: OamSpec, r: OamIndexRow, group: OamIndexRow[] = [r]): Fi
     has_machine_readable_report: Boolean(r.json_key),
     json_url: null,
     report_url: null,
-    viewer_url: r.viewer_url,
+    viewer_url: spec.noLinks ? null : r.viewer_url,
     package_url: null,
     title: r.title,
     package_sha256: r.zip_sha256,
-    source_url: r.source_url,
+    source_url: spec.noLinks ? null : r.source_url,
     ...(r.report_scope ? { report_scope: r.report_scope } : {}),
     ...(r.nif ? { national_identifier: r.nif } : {}),
     ...(r.company_number ? { national_identifier: r.company_number } : {}),
@@ -1537,9 +1562,10 @@ const INDEX_GAP: Partial<Record<OamId, string>> = {
   newsweb: ' filings.xbrl.org stopped adding Norwegian filings in May 2025.',
   fi: ' filings.xbrl.org stopped adding Swedish filings on 2025-05-08, so current Swedish reports come only from FI.',
   fsma: ' filings.xbrl.org carries only part of Belgium and has added no Belgian filing since 2026-05-12.',
+  mse: ' filings.xbrl.org stopped adding Maltese filings on 2025-05-21, so current Maltese reports come only from the Malta Stock Exchange OAM.',
 };
 const OAM_EXCEPTIONS =
-  'Portugal (CMVM), Spain (CNMV), Norway (Oslo Børs NewsWeb), Sweden (Finansinspektionen) and Belgium (FSMA STORI) are also read from the national regulator, so pinning `country` to PT, ES, NO, SE or BE gets coverage that follows official publication.';
+  'Portugal (CMVM), Spain (CNMV), Norway (Oslo Børs NewsWeb), Sweden (Finansinspektionen), Belgium (FSMA STORI) and Malta (the Malta Stock Exchange OAM) are also read from the national storage mechanism, so pinning `country` to PT, ES, NO, SE, BE or MT gets coverage that follows official publication.';
 
 function coverageNote(country: string | null | undefined, consulted: OamSpec[], loads: OamLoads | null): string {
   const live = consulted.filter((s) => loads?.[s.id]?.ok);
@@ -1565,7 +1591,7 @@ function coverageNote(country: string | null | undefined, consulted: OamSpec[], 
 
 // ── tool definitions ───────────────────────────────────────────────────────
 const SCOPE_LINE =
-  'Covers 25,640 filings in two regimes: ESEF (~16,000 annual financial reports from 19 European countries — AT BE CY CZ DK ES FI FR GB GR IS IT LT NL NO PL PT RO SE) and UAIFRS (~9,600 Ukrainian IFRS filings, country UA). Pass `country` or `regime` to pin the scope you mean. Portuguese (PT), Spanish (ES) and Norwegian (NO) ESEF reports are also read directly from where each country publishes them — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway — so PT, ES and NO coverage follows official publication (typically within a day) rather than the index\'s months-long lag; each row names its `source` and those rows carry the official `published_at`. Swedish (SE) reports are likewise read from Finansinspektionen (FI), the Swedish OAM, which is the only source for Swedish FY2025 reports, and Belgian (BE) reports from the FSMA\'s STORI database, the Belgian OAM.';
+  'Covers 25,640 filings in two regimes: ESEF (~16,000 annual financial reports from 19 European countries — AT BE CY CZ DK ES FI FR GB GR IS IT LT NL NO PL PT RO SE) and UAIFRS (~9,600 Ukrainian IFRS filings, country UA). Pass `country` or `regime` to pin the scope you mean. Portuguese (PT), Spanish (ES) and Norwegian (NO) ESEF reports are also read directly from where each country publishes them — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway — so PT, ES and NO coverage follows official publication (typically within a day) rather than the index\'s months-long lag; each row names its `source` and those rows carry the official `published_at`. Swedish (SE) reports are likewise read from Finansinspektionen (FI), the Swedish OAM, which is the only source for Swedish FY2025 reports, Belgian (BE) reports from the FSMA\'s STORI database, the Belgian OAM, and Maltese (MT) reports from the Malta Stock Exchange OAM, the only source for Maltese FY2025 reports.';
 
 const tools: McpToolExport['tools'] = [
   {
@@ -1585,7 +1611,7 @@ const tools: McpToolExport['tools'] = [
         country: {
           type: 'string',
           description:
-            'ISO-2 country of the filing jurisdiction: AT, BE, CY, CZ, DK, ES, FI, FR, GB, GR, IS, IT, LT, NL, NO, PL, PT, RO, SE (ESEF) or UA (UAIFRS).',
+            'ISO-2 country of the filing jurisdiction: AT, BE, CY, CZ, DK, ES, FI, FR, GB, GR, IS, IT, LT, MT, NL, NO, PL, PT, RO, SE (ESEF) or UA (UAIFRS).',
         },
         regime: {
           type: 'string',
@@ -1657,14 +1683,14 @@ const tools: McpToolExport['tools'] = [
     description:
       'Read the actual IFRS financial facts out of one published annual report — revenue, profit or loss, total assets, equity, operating cash flow, earnings per share and every other tagged figure, with the currency, the exact reporting period and the XBRL concept name. This is the numbers hop: esef_search_filings and esef_entity_filings prove a filing exists, this one opens its machine-readable xBRL-JSON report and returns what the company reported. ' +
       SCOPE_LINE +
-      ' Identify the filing by fxo_id from a search result (a Portuguese CMVM filing looks like "cmvm-1355933", a Spanish CNMV filing "cnmv-20912", a Norwegian NewsWeb filing "newsweb-668785-321602", a Swedish FI filing "fi-61807", a Belgian STORI filing "fsma-5c08f790-404c-4121-bd0b-0cf3350455da"), or just by company name or LEI plus an optional year and the latest matching report is used (the national copy for Portuguese, Spanish, Norwegian, Swedish and Belgian issuers, otherwise the English-language edition). Pass `concept` to pull one line item (case-insensitive substring of the IFRS concept, e.g. "Revenue", "ProfitLoss", "Assets", "Equity", "CashFlows"); omit it for a headline projection of the main statement figures. Facts repeated across statements are collapsed, consolidated totals are separated from segment and equity-component breakdowns, and the full concept inventory of the report is returned so a follow-up query can target any line item.',
+      ' Identify the filing by fxo_id from a search result (a Portuguese CMVM filing looks like "cmvm-1355933", a Spanish CNMV filing "cnmv-20912", a Norwegian NewsWeb filing "newsweb-668785-321602", a Swedish FI filing "fi-61807", a Belgian STORI filing "fsma-5c08f790-404c-4121-bd0b-0cf3350455da", a Maltese MSE filing "mse-BOV_20251231_CON_AFR_529900RWC8ZYB066JF16_20260326114707204"), or just by company name or LEI plus an optional year and the latest matching report is used (the national copy for Portuguese, Spanish, Norwegian, Swedish, Belgian and Maltese issuers, otherwise the English-language edition). Pass `concept` to pull one line item (case-insensitive substring of the IFRS concept, e.g. "Revenue", "ProfitLoss", "Assets", "Equity", "CashFlows"); omit it for a headline projection of the main statement figures. Facts repeated across statements are collapsed, consolidated totals are separated from segment and equity-component breakdowns, and the full concept inventory of the report is returned so a follow-up query can target any line item.',
     inputSchema: {
       type: 'object',
       properties: {
         fxo_id: {
           type: 'string',
           description:
-            'Filing identifier from esef_search_filings or esef_entity_filings, e.g. "549300P8N0P6KDGTJ206-2022-12-31-ESEF-FI-0", "cmvm-1355933" for a Portuguese filing read from CMVM, "cnmv-20912" for a Spanish filing read from CNMV, "newsweb-668785-321602" for a Norwegian filing read from Oslo Børs NewsWeb, "fi-61807" for a Swedish filing read from Finansinspektionen, or "fsma-5c08f790-404c-4121-bd0b-0cf3350455da" for a Belgian filing read from FSMA STORI. Most precise way to name a filing.',
+            'Filing identifier from esef_search_filings or esef_entity_filings, e.g. "549300P8N0P6KDGTJ206-2022-12-31-ESEF-FI-0", "cmvm-1355933" for a Portuguese filing read from CMVM, "cnmv-20912" for a Spanish filing read from CNMV, "newsweb-668785-321602" for a Norwegian filing read from Oslo Børs NewsWeb, "fi-61807" for a Swedish filing read from Finansinspektionen, "fsma-5c08f790-404c-4121-bd0b-0cf3350455da" for a Belgian filing read from FSMA STORI, or "mse-BOV_20251231_CON_AFR_529900RWC8ZYB066JF16_20260326114707204" for a Maltese filing read from the Malta Stock Exchange OAM. Most precise way to name a filing.',
         },
         entity: {
           type: 'string',
@@ -1861,9 +1887,10 @@ async function searchFilings(args: Record<string, unknown>) {
       ...(oamMatches.newsweb != null ? { newsweb_matches: oamMatches.newsweb } : {}),
       ...(oamMatches.fi != null ? { fi_matches: oamMatches.fi } : {}),
       ...(oamMatches.fsma != null ? { fsma_matches: oamMatches.fsma } : {}),
+      ...(oamMatches.mse != null ? { mse_matches: oamMatches.mse } : {}),
       duplicates_collapsed: merged.duplicates,
       merge_complete: xbrlTotal == null || xbrl.length >= xbrlTotal,
-      note: "Portuguese, Spanish, Norwegian, Swedish and Belgian results combine filings.xbrl.org with the country's official publication channel — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway, Finansinspektionen (FI) for Sweden, FSMA STORI for Belgium. A report on both appears once (matched by LEI and period end); `source` says which copy the row describes and `also_on_xbrl_org` / `also_on_cmvm` / `also_on_cnmv` / `also_on_newsweb` / `also_on_fi` / `also_on_fsma` names the other. `published_at` is the regulator's official publication time (CNMV: to the minute where its disclosure feed carries the filing, else the day; NewsWeb: the announcement time, UTC; FI: to the minute, Stockholm offset; STORI: the issuer's publication time, Brussels offset, with STORI's own receipt time as `received_at`); xbrl.org rows only carry `date_added`, the day that index picked the report up. A Spanish issuer that files individual and consolidated accounts in one package gets one row each, labelled by `report_scope`.",
+      note: "Portuguese, Spanish, Norwegian, Swedish, Belgian and Maltese results combine filings.xbrl.org with the country's official publication channel — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway, Finansinspektionen (FI) for Sweden, FSMA STORI for Belgium, the Malta Stock Exchange OAM (MSE) for Malta. A report on both appears once (matched by LEI and period end); `source` says which copy the row describes and `also_on_xbrl_org` / `also_on_cmvm` / `also_on_cnmv` / `also_on_newsweb` / `also_on_fi` / `also_on_fsma` / `also_on_mse` names the other. `published_at` is the regulator's official publication time (CNMV: to the minute where its disclosure feed carries the filing, else the day; NewsWeb: the announcement time, UTC; FI: to the minute, Stockholm offset; STORI: the issuer's publication time, Brussels offset, with STORI's own receipt time as `received_at`; MSE: the OAM announcement time, Malta offset); xbrl.org rows only carry `date_added`, the day that index picked the report up. A Spanish issuer that files individual and consolidated accounts in one package gets one row each, labelled by `report_scope`.",
     };
   }
 
@@ -2358,7 +2385,7 @@ async function resolveFilingForFacts(args: Record<string, unknown>): Promise<
         payload: {
           found: false,
           reason: 'filing_not_found',
-          hint: `No filing with fxo_id "${fxoId}". fxo_id looks like "549300P8N0P6KDGTJ206-2022-12-31-ESEF-FI-0" — identifier, period end, regime, country, sequence — or "cmvm-1355933" / "cnmv-20912" / "newsweb-668785-321602" / "fi-61807" / "fsma-5c08f790-404c-4121-bd0b-0cf3350455da" for a Portuguese / Spanish / Norwegian / Swedish / Belgian filing read from CMVM / CNMV / Oslo Børs NewsWeb / FI / FSMA STORI. Get an exact one from esef_search_filings or esef_entity_filings, or call this tool with \`entity\` and \`year\` instead.`,
+          hint: `No filing with fxo_id "${fxoId}". fxo_id looks like "549300P8N0P6KDGTJ206-2022-12-31-ESEF-FI-0" — identifier, period end, regime, country, sequence — or "cmvm-1355933" / "cnmv-20912" / "newsweb-668785-321602" / "fi-61807" / "fsma-5c08f790-404c-4121-bd0b-0cf3350455da" / "mse-BOV_20251231_CON_AFR_529900RWC8ZYB066JF16_20260326114707204" for a Portuguese / Spanish / Norwegian / Swedish / Belgian / Maltese filing read from CMVM / CNMV / Oslo Børs NewsWeb / FI / FSMA STORI / the Malta Stock Exchange OAM. Get an exact one from esef_search_filings or esef_entity_filings, or call this tool with \`entity\` and \`year\` instead.`,
           fxo_id: fxoId,
         },
       };

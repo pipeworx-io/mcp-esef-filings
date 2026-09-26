@@ -156,7 +156,7 @@ So Swedish filings also come from FI, with the same merge, dedup by LEI + period
 
 Name resolution runs on filings.xbrl.org first, and the shortest matching name wins. `"Ericsson"` matches **ERICSSON NIKOLA TESLA d.d.** (Croatia) there, and Telefonaktiebolaget LM Ericsson's FY2025 is only in the FI index — so `esef_filing_facts {entity:"Ericsson", year:2025}` used to answer a confident `no_filing_for_year` (fleet #2372).
 
-When `esef_filing_facts` resolves by name and the picked issuer has no filing for the requested `year`, it now searches the regulator indexes (CMVM, CNMV, NewsWeb, FI, FSMA STORI, MSE) for other issuers whose name matches and who do:
+When `esef_filing_facts` resolves by name and the picked issuer has no filing for the requested `year`, it now searches the regulator indexes (CMVM, CNMV, NewsWeb, FI, FSMA STORI, MSE, HANFA SRPI) for other issuers whose name matches and who do:
 
 - exactly one → that issuer's report is used, and `resolved_by` says the name first matched someone else;
 - more than one → `reason: "ambiguous_entity"` with `candidates` (name, country, LEI, source, filing_id); the tool never guesses.
@@ -187,6 +187,17 @@ Same merge, dedup by LEI + period end, and freshness contract as GOTCHA 10-15:
 - Non-December year ends are common (MaltaPost 30 Sep, Farsons 31 Jan). `year` filters on the period end, as everywhere in this pack.
 - The exchange's terms let anyone save and reproduce the files provided "the source is to be stated and the material not altered or distorted": rows name the source, packages are stored as downloaded.
 
+### GOTCHA 17 — Croatia comes only from HANFA SRPI
+
+filings.xbrl.org **stopped adding Croatian filings on 2025-05-21**: HR FY2024 = 30, FY2025 = 0. HANFA's **SRPI**, Croatia's officially appointed mechanism, received 178 annual-report submissions carrying an ESEF package from 77 issuers in 2026 (survey: `docs/esef-freshness-survey.md` Part 11, fleet #2435).
+
+- `source` is `hanfa`; the other copy, where one exists, is `also_on_xbrl_org` / `also_on_hanfa`. Every response that consulted SRPI carries **`hanfa_status`** (same fields as `cmvm_status`).
+- SRPI filing ids are SRPI's submission number: `hanfa-1214588` (Hrvatski Telekom FY2025, English, consolidated). `published_at` is when SRPI received the submission (Zagreb offset).
+- **Croatian issuers file separate consolidated and non-consolidated packages**, each its own submission, often in Croatian and English too. They are distinct rows labelled by `report_scope` (`consolidated` / `individual`); the language editions of one scope are one row, English served, all under `versions`.
+- A correction is a new SRPI submission and the old one stays listed. Every package is kept; the newest converted package per LEI + period + scope is served.
+- Submissions that carry no ESEF package (a PDF, or HANFA's own XLSX "GFI" form) have no row; the index lists them under `submissions_without_esef`.
+- The listing's contact column (the filer's named contact person, phone and e-mail) is never collected.
+
 ## Data sources
 
 - Index: `https://filings.xbrl.org/api/filings` (JSON:API, header `Accept: application/vnd.api+json`)
@@ -198,6 +209,7 @@ Same merge, dedup by LEI + period end, and freshness contract as GOTCHA 10-15:
 - Sweden: Finansinspektionen Börsinformation (`https://finanscentralen.fi.se/search/SearchByRegistrationDate.aspx`, file `GetFile.aspx?fid=<N>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_fi.py`)
 - Belgium: FSMA STORI (`https://webapi.fsma.be/api/v1/en/stori/result`, keyless JSON; file `…/stori/download?fileDataId=<uuid>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_fsma.py`)
 - Malta: the Malta Stock Exchange's Officially Appointed Mechanism (named, not linked: the exchange's terms prohibit linking to its site without written permission), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_mse.py`). Maltese rows carry no `source_url` / `viewer_url` for the same reason.
+- Croatia: HANFA SRPI (`https://www.hanfa.hr/Api/SRPI/GetData`, keyless form POST; file `https://www.hanfa.hr/SRPI/<HR|EN>/<year>/<date>-<id>_zip.zip`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_hanfa.py`). HANFA states that every user may reuse its information for commercial or non-commercial purposes under the Croatian Right to Access Information Act
 
 ## Quick Start
 

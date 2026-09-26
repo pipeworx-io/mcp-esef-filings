@@ -210,6 +210,16 @@ Same merge, dedup by LEI + period end, and freshness contract as GOTCHA 10-17:
 - Some ZIPs attached beside the package hold only PDFs (MOL's "other documents"); they have no row and are listed under `publications_without_inline_xbrl`.
 - The MNB's copyright statement allows free reuse if any transformation is stated, so `esef_filing_facts` on an MNB filing carries a `transformation` line: the figures are converted from the issuer's iXBRL, they are the issuer's, not the MNB's.
 
+### GOTCHA 19 — Lithuania merges oam.lt with filings.xbrl.org
+
+filings.xbrl.org carries Lithuania only in part (FY2025: 17 issuers, nothing added since 2026-05-12) and never had Ignitis Group. **oam.lt**, the central storage of regulated information that Nasdaq Vilnius runs as Lithuania's officially appointed mechanism, carries every issuer's annual report (survey: `docs/esef-freshness-survey.md` Part 13, fleet #2453). LT rows merge both by LEI + period end.
+
+- `source` is `oamlt`; the other copy is `also_on_xbrl_org` / `also_on_oamlt`. Every response that consulted oam.lt carries **`oamlt_status`**.
+- Filing ids are `oamlt-<messageId>-<attachmentId>`: `oamlt-468051-338788` (Ignitis grupė FY2025). `published_at` is the announcement time (Vilnius offset).
+- The issuer label on oam.lt is Nasdaq's short name ("Ignitis grupe"); the LEI comes only from the inline XBRL.
+- Not every annual-report attachment is an ESEF package: Ignitis wraps its package in a `.7z` inside the ZIP (unwrapped), many issuers e-sign it as an ASiC-E container (`.asice`), and Telia Lietuva files a bare XHTML with no inline XBRL (listed under `publications_without_inline_xbrl`, no row). Amber Grid's FY2025 annual report is on filings.xbrl.org but the backfill collected no package for it from oam.lt (only its "Operating Results" message, which has none); its row comes from the index.
+- A corrected report is a new oam.lt message; the newest converted package per LEI + period is served.
+
 ## Data sources
 
 - Index: `https://filings.xbrl.org/api/filings` (JSON:API, header `Accept: application/vnd.api+json`)
@@ -223,6 +233,7 @@ Same merge, dedup by LEI + period end, and freshness contract as GOTCHA 10-17:
 - Malta: the Malta Stock Exchange's Officially Appointed Mechanism (named, not linked: the exchange's terms prohibit linking to its site without written permission), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_mse.py`). Maltese rows carry no `source_url` / `viewer_url` for the same reason.
 - Croatia: HANFA SRPI (`https://www.hanfa.hr/Api/SRPI/GetData`, keyless form POST; file `https://www.hanfa.hr/SRPI/<HR|EN>/<year>/<date>-<id>_zip.zip`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_hanfa.py`). HANFA states that every user may reuse its information for commercial or non-commercial purposes under the Croatian Right to Access Information Act
 - Hungary: MNB Közzétételek (`https://kozzetetelek.mnb.hu/search/advanced`, HTML form; view `…/kozzetetelek?viewid=K<n>/<year>`; file `…/downloadkozzetetel?id=<n>&did=K<n>/<year>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_mnb.py`)
+- Lithuania: oam.lt, the Lithuanian OAM run by Nasdaq Vilnius (`https://oam.lt/`, HTML form POST, category 171 = annual financial report; message `/view/<messageId>`; file `/cns-web/oam/viewAttachment.action?messageAttachmentId=<N>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_oamlt.py`)
 
 ## Quick Start
 

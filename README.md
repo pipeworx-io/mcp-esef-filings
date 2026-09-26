@@ -2,7 +2,7 @@
 
 XBRL filings index MCP — published company annual reports from the filings.xbrl.org index run by XBRL International, plus the IFRS financial facts inside each one. Keyless.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1684+ live data sources.
 
 The European counterpart to `sec-xbrl`: same idea (accounting facts straight out of a regulator's XBRL), different filing regime.
 
@@ -198,6 +198,18 @@ filings.xbrl.org **stopped adding Croatian filings on 2025-05-21**: HR FY2024 = 
 - Submissions that carry no ESEF package (a PDF, or HANFA's own XLSX "GFI" form) have no row; the index lists them under `submissions_without_esef`.
 - The listing's contact column (the filer's named contact person, phone and e-mail) is never collected.
 
+### GOTCHA 18 — Hungary comes from the MNB: filings.xbrl.org stopped in May 2025
+
+filings.xbrl.org **stopped adding Hungarian filings on 2025-05-21** (HU FY2024 = 29 filings, FY2025 = 0) and never carried OTP Bank or Richter Gedeon. Every issuer files its ESEF package with the MNB's **Közzétételek** site (`kozzetetelek.mnb.hu`), Hungary's officially appointed mechanism (survey: `docs/esef-freshness-survey.md` Part 12, fleet #2437).
+
+Same merge, dedup by LEI + period end, and freshness contract as GOTCHA 10-17:
+
+- `source` is `mnb`; the other copy is `also_on_xbrl_org` / `also_on_mnb`. Every response that consulted the MNB carries **`mnb_status`**.
+- Filing ids are the MNB document id: `mnb-909016` (OTP Bank FY2025, English package). `published_at` is the MNB publication time (Budapest offset). `national_identifier` is the MNB's "Intézmény törzsszáma" company number, not an LEI; the LEI comes from the inline XBRL, then the package root folder, then the `<LEI>-<period>-…` file name.
+- Issuers attach one package per language (`…-en.zip`, `…-hu.zip`); one is collected, English first. A disclosure that carries two reports (separate and consolidated) gives one row each.
+- Some ZIPs attached beside the package hold only PDFs (MOL's "other documents"); they have no row and are listed under `publications_without_inline_xbrl`.
+- The MNB's copyright statement allows free reuse if any transformation is stated, so `esef_filing_facts` on an MNB filing carries a `transformation` line: the figures are converted from the issuer's iXBRL, they are the issuer's, not the MNB's.
+
 ## Data sources
 
 - Index: `https://filings.xbrl.org/api/filings` (JSON:API, header `Accept: application/vnd.api+json`)
@@ -210,6 +222,7 @@ filings.xbrl.org **stopped adding Croatian filings on 2025-05-21**: HR FY2024 = 
 - Belgium: FSMA STORI (`https://webapi.fsma.be/api/v1/en/stori/result`, keyless JSON; file `…/stori/download?fileDataId=<uuid>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_fsma.py`)
 - Malta: the Malta Stock Exchange's Officially Appointed Mechanism (named, not linked: the exchange's terms prohibit linking to its site without written permission), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_mse.py`). Maltese rows carry no `source_url` / `viewer_url` for the same reason.
 - Croatia: HANFA SRPI (`https://www.hanfa.hr/Api/SRPI/GetData`, keyless form POST; file `https://www.hanfa.hr/SRPI/<HR|EN>/<year>/<date>-<id>_zip.zip`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_hanfa.py`). HANFA states that every user may reuse its information for commercial or non-commercial purposes under the Croatian Right to Access Information Act
+- Hungary: MNB Közzétételek (`https://kozzetetelek.mnb.hu/search/advanced`, HTML form; view `…/kozzetetelek?viewid=K<n>/<year>`; file `…/downloadkozzetetel?id=<n>&did=K<n>/<year>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_mnb.py`)
 
 ## Quick Start
 
@@ -255,7 +268,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1684+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

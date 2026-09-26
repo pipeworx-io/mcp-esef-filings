@@ -9,7 +9,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import pack from './index.js';
 
 const server = new Server(
-  { name: '@pipeworx/mcp-esef-filings', version: '0.1.4' },
+  { name: '@pipeworx/mcp-esef-filings', version: '0.1.5' },
   { capabilities: { tools: {} } },
 );
 

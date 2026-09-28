@@ -220,6 +220,16 @@ filings.xbrl.org carries Lithuania only in part (FY2025: 17 issuers, nothing add
 - Not every annual-report attachment is an ESEF package: Ignitis wraps its package in a `.7z` inside the ZIP (unwrapped), many issuers e-sign it as an ASiC-E container (`.asice`), and Telia Lietuva files a bare XHTML with no inline XBRL (listed under `publications_without_inline_xbrl`, no row). Amber Grid's FY2025 annual report is on filings.xbrl.org but the backfill collected no package for it from oam.lt (only its "Operating Results" message, which has none); its row comes from the index.
 - A corrected report is a new oam.lt message; the newest converted package per LEI + period is served.
 
+### GOTCHA 20 — Romania comes only from the ASF OAM for FY2025
+
+filings.xbrl.org had no Romanian FY2025 filing. **The ASF OAM** (`oam.asfromania.ro`), the Romanian officially appointed mechanism run by the Autoritatea de Supraveghere Financiară, carries every issuer's annual financial report (RFA) (survey: `docs/esef-freshness-survey.md` Part 15, fleet #2487). RO rows merge with any xbrl.org copy by LEI + period end.
+
+- `source` is `asf`; every response that consulted it carries **`asf_status`**. Filing ids are `asf-<symbol>-<upload stamp>`: `asf-SNP-20260319180945` (OMV Petrom FY2025, consolidated). `published_at` is the upload time (Bucharest offset).
+- **Only the consolidated package carries inline XBRL.** A standalone (individual) report is a plain XHTML with no `ix:` tags. It is kept as a row WITHOUT facts (`has_machine_readable_report: false`, `report_scope: "individual"`), with the issuer's LEI and period borrowed from its tagged package. `esef_filing_facts` by entity + year picks the consolidated row.
+- `report_scope` comes from the issuer's upload note when it says "consolidat…" or "individual…"; otherwise a tagged package is labelled consolidated and an untagged one individual (`scope_source: "inferred_from_tagging"` in the index).
+- An issuer uploads a Romanian and an English edition, and corrections as new uploads ("Corectare"); all are `versions` of one row, the newest converted one is served.
+- Never fetch from bvb.ro: the Bucharest Stock Exchange also hosts the packages, but its terms ban automated programs.
+
 ## Data sources
 
 - Index: `https://filings.xbrl.org/api/filings` (JSON:API, header `Accept: application/vnd.api+json`)
@@ -234,6 +244,7 @@ filings.xbrl.org carries Lithuania only in part (FY2025: 17 issuers, nothing add
 - Croatia: HANFA SRPI (`https://www.hanfa.hr/Api/SRPI/GetData`, keyless form POST; file `https://www.hanfa.hr/SRPI/<HR|EN>/<year>/<date>-<id>_zip.zip`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_hanfa.py`). HANFA states that every user may reuse its information for commercial or non-commercial purposes under the Croatian Right to Access Information Act
 - Hungary: MNB Közzétételek (`https://kozzetetelek.mnb.hu/search/advanced`, HTML form; view `…/kozzetetelek?viewid=K<n>/<year>`; file `…/downloadkozzetetel?id=<n>&did=K<n>/<year>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_mnb.py`)
 - Lithuania: oam.lt, the Lithuanian OAM run by Nasdaq Vilnius (`https://oam.lt/`, HTML form POST, category 171 = annual financial report; message `/view/<messageId>`; file `/cns-web/oam/viewAttachment.action?messageAttachmentId=<N>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_oamlt.py`)
+- Romania: the ASF OAM (`https://oam.asfromania.ro/oam/loadedPDFReportsForPublic.jsp`, a report engine whose filter lives in the session: RFA type 1267 + a publication-date window; each row's uploads on `participants/loadedPDFReportsVersions.jsp`; file `/oam/DownloadPDFFile.do?nume_raportare=<name>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_asf.py`)
 
 ## Quick Start
 

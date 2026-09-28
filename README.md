@@ -230,6 +230,16 @@ filings.xbrl.org had no Romanian FY2025 filing. **The ASF OAM** (`oam.asfromania
 - An issuer uploads a Romanian and an English edition, and corrections as new uploads ("Corectare"); all are `versions` of one row, the newest converted one is served.
 - Never fetch from bvb.ro: the Bucharest Stock Exchange also hosts the packages, but its terms ban automated programs.
 
+### GOTCHA 21 — Cyprus comes only from the Cyprus Stock Exchange OAM for current reports
+
+filings.xbrl.org has added nothing for Cyprus since FY2022 (34 filings, newest 2023-05-30). **publicoam.cse.com.cy**, the Cyprus Stock Exchange's officially appointed mechanism, carries every issuer's annual financial report over a keyless JSON API (survey: `docs/esef-freshness-survey.md` Part 15, fleet #2489).
+
+- `source` is `cse`; the other copy is `also_on_xbrl_org` / `also_on_cse`. Every response that consulted the CSE carries **`cse_status`**.
+- Filing ids are `cse-<listingVersionId>-<fileId>`: `cse-222818-223858` (Bank of Cyprus Holdings FY2025, English package). `published_at` is the OAM publication time (Nicosia offset).
+- A report and its translation are two OAM announcements, each with its own package (`…-el.zip`, `…-en.zip`); both are collected and the pack groups them by LEI + period end, so one of them shows as a `versions` entry.
+- The annual-report category also carries board decisions, AGM notices and PDF-only results, and some issuers (single-entity accounts, which ESEF does not require to be tagged) file a ZIP holding a bare untagged XHTML: Interfund and Dome Investments FY2025. None of those gets a row; they are listed under `publications_without_inline_xbrl`.
+- The listing API's `registryTimestamp` parameter is a real lower bound on the date, but its `sort` does nothing and small pages lose rows (pages of 500 served 2,817 distinct of 3,592). The collector takes 2,000-row pages and refuses a short read. Details: `scripts/esef-cmvm/cse.py`.
+
 ## Data sources
 
 - Index: `https://filings.xbrl.org/api/filings` (JSON:API, header `Accept: application/vnd.api+json`)
@@ -245,6 +255,7 @@ filings.xbrl.org had no Romanian FY2025 filing. **The ASF OAM** (`oam.asfromania
 - Hungary: MNB Közzétételek (`https://kozzetetelek.mnb.hu/search/advanced`, HTML form; view `…/kozzetetelek?viewid=K<n>/<year>`; file `…/downloadkozzetetel?id=<n>&did=K<n>/<year>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_mnb.py`)
 - Lithuania: oam.lt, the Lithuanian OAM run by Nasdaq Vilnius (`https://oam.lt/`, HTML form POST, category 171 = annual financial report; message `/view/<messageId>`; file `/cns-web/oam/viewAttachment.action?messageAttachmentId=<N>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_oamlt.py`)
 - Romania: the ASF OAM (`https://oam.asfromania.ro/oam/loadedPDFReportsForPublic.jsp`, a report engine whose filter lives in the session: RFA type 1267 + a publication-date window; each row's uploads on `participants/loadedPDFReportsVersions.jsp`; file `/oam/DownloadPDFFile.do?nume_raportare=<name>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_asf.py`)
+- Cyprus: the Cyprus Stock Exchange public OAM (`https://publicoam.cse.com.cy/xak-public-pages-server/api/fetch-listing-versions?informationCategoryId=16&registryTimestamp=<YYYY-MM-DD>`, keyless JSON; files inline as base64 from `…/fetch-files?listingVersionId=<id>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_cse.py`)
 
 ## Quick Start
 

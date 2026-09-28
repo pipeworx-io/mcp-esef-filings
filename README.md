@@ -229,7 +229,6 @@ filings.xbrl.org had no Romanian FY2025 filing. **The ASF OAM** (`oam.asfromania
 - `report_scope` comes from the issuer's upload note when it says "consolidat…" or "individual…"; otherwise a tagged package is labelled consolidated and an untagged one individual (`scope_source: "inferred_from_tagging"` in the index).
 - An issuer uploads a Romanian and an English edition, and corrections as new uploads ("Corectare"); all are `versions` of one row, the newest converted one is served.
 - Never fetch from bvb.ro: the Bucharest Stock Exchange also hosts the packages, but its terms ban automated programs.
-
 ### GOTCHA 21 — Cyprus comes only from the Cyprus Stock Exchange OAM for current reports
 
 filings.xbrl.org has added nothing for Cyprus since FY2022 (34 filings, newest 2023-05-30). **publicoam.cse.com.cy**, the Cyprus Stock Exchange's officially appointed mechanism, carries every issuer's annual financial report over a keyless JSON API (survey: `docs/esef-freshness-survey.md` Part 15, fleet #2489).
@@ -239,6 +238,16 @@ filings.xbrl.org has added nothing for Cyprus since FY2022 (34 filings, newest 2
 - A report and its translation are two OAM announcements, each with its own package (`…-el.zip`, `…-en.zip`); both are collected and the pack groups them by LEI + period end, so one of them shows as a `versions` entry.
 - The annual-report category also carries board decisions, AGM notices and PDF-only results, and some issuers (single-entity accounts, which ESEF does not require to be tagged) file a ZIP holding a bare untagged XHTML: Interfund and Dome Investments FY2025. None of those gets a row; they are listed under `publications_without_inline_xbrl`.
 - The listing API's `registryTimestamp` parameter is a real lower bound on the date, but its `sort` does nothing and small pages lose rows (pages of 500 served 2,817 distinct of 3,592). The collector takes 2,000-row pages and refuses a short read. Details: `scripts/esef-cmvm/cse.py`.
+
+### GOTCHA 22 — Latvia comes only from CSRI for FY2024 and FY2025
+
+filings.xbrl.org has 36 Latvian filings and none newer than FY2023 (last added 2024-07-09). **CSRI** (`csri.investinfo.lv`), the Central Storage of Regulated Information run for Latvijas Banka and Latvia's officially appointed mechanism, carries the current reports (survey: `docs/esef-freshness-survey.md` Part 15, fleet #2492). LV rows merge both by LEI + period end, so FY2023 and earlier can still come from the index.
+
+- `source` is `csri`; the other copy is `also_on_xbrl_org` / `also_on_csri`. Every response that consulted CSRI carries **`csri_status`**.
+- Filing ids are `csri-<docId>-<docVersion>`: `csri-24777-1` (Citadele banka FY2025). `published_at` is the date-time of the document version served (Riga offset); a re-filed version is a new id.
+- Every announcement is filed twice, as an EN and an LV document with different ids. The LV one is skipped when its EN twin already gave a package, and a byte-identical package filed under another document is listed under `duplicate_documents`, not as a row. Where the only package is Latvian-language (Longo, AST FY2025) the row is the Latvian report.
+- Category 1.1 also carries press releases, unaudited full-year results and calendar corrections, and several issuers file untagged XHTML (Altum, Siguldas CMAS, Rīgas ūdens and PN Project's separate accounts FY2025: stand-alone accounts, which ESEF does not require to be tagged). Those are listed under `publications_without_inline_xbrl`, with no row.
+- The issuer's LEI is on the CSRI details page; the row's LEI still comes from the inline XBRL first.
 
 ## Data sources
 
@@ -256,6 +265,7 @@ filings.xbrl.org has added nothing for Cyprus since FY2022 (34 filings, newest 2
 - Lithuania: oam.lt, the Lithuanian OAM run by Nasdaq Vilnius (`https://oam.lt/`, HTML form POST, category 171 = annual financial report; message `/view/<messageId>`; file `/cns-web/oam/viewAttachment.action?messageAttachmentId=<N>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_oamlt.py`)
 - Romania: the ASF OAM (`https://oam.asfromania.ro/oam/loadedPDFReportsForPublic.jsp`, a report engine whose filter lives in the session: RFA type 1267 + a publication-date window; each row's uploads on `participants/loadedPDFReportsVersions.jsp`; file `/oam/DownloadPDFFile.do?nume_raportare=<name>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_asf.py`)
 - Cyprus: the Cyprus Stock Exchange public OAM (`https://publicoam.cse.com.cy/xak-public-pages-server/api/fetch-listing-versions?informationCategoryId=16&registryTimestamp=<YYYY-MM-DD>`, keyless JSON; files inline as base64 from `…/fetch-files?listingVersionId=<id>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_cse.py`)
+- Latvia: CSRI, the Latvian OAM run for Latvijas Banka (`https://csri.investinfo.lv/en/?view=csridocuments&doc_types[]=111`, keyless GET, 20 rows a page; details `?view=csridocumentsdetails&id=<docId>`; file `/?task=download&doc_id=<docId>&doc_version=<v>&f_id=<fileId>`), ESEF packages as published by each issuer, converted the same way (`scripts/esef-cmvm/collect_csri.py`)
 
 ## Quick Start
 

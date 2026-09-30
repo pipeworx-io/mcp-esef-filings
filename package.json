@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-esef-filings",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "XBRL filings index MCP — wraps the filings.xbrl.org JSON:API index run by",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-81c96165e773badd8a6ec008436a949bc5d9cec075dad750a7045a484c8db203",
-    "sourceCommit": "ddfce196e5567c6f37bdb64ddd561fd1ea1e45cb"
+    "sourceHash": "v1-1545f1453a78f1269d597073f2e9f640c235ced61695fa98df8487a6a62d7fad",
+    "sourceCommit": "658bedc4e66c6eab7e17c569f81012a2ee312624"
   }
 }

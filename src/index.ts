@@ -1020,7 +1020,7 @@ interface XbrlOrgRef {
 interface FilingRow {
   filing_id: string;
   fxo_id: string;
-  source: 'xbrl.org' | OamId;
+  source: 'xbrl.org' | OamId | LiveId;
   entity_name: string | null;
   entity_identifier: string | null;
   country: string | null;
@@ -1048,6 +1048,8 @@ interface FilingRow {
   national_identifier?: string | null;
   /** STORI: when the FSMA's database received the report (published_at is the issuer's own publication time) */
   received_at?: string | null;
+  /** SEOnet (live): period_end is a guess from a four-digit year in the announcement title, not a field the source states */
+  period_end_inferred?: boolean;
   versions?: Array<{ filing_id: string; published_at: string | null; title: string | null }>;
   also_on_cmvm?: OamRef;
   also_on_cnmv?: OamRef;
@@ -1353,6 +1355,927 @@ function oamForId(filingId: string): OamSpec | null {
 
 function oamForCountry(country: string | null | undefined): OamSpec | null {
   return OAM_LIST.find((s) => s.country === (country ?? '').toUpperCase()) ?? null;
+}
+
+// ── Live-only OAMs: Luxembourg (LuxSE), Slovenia (SEOnet), Estonia (FI) ─────
+//
+// fleet #2429/#2482/survey Part 15: these three OAMs' terms restrict
+// REPRODUCTION and DISSEMINATION/DISTRIBUTION of their information without
+// the operator's consent — LuxSE sells that right as a paid Documents +
+// Dissemination licence, SEOnet's clause bars commercial use and reproduction
+// "in any form", the FSA's carves out journalism/non-profit use. None of the
+// three bans automated ACCESS. Per CLAUDE.md's standing rule
+// (`mirror-needs-grant-proxy-does-not`, fleet #1389): calling a public source
+// live, per request, and handing the answer to the one caller who asked is a
+// client, not a publisher — no grant needed. Bulk-copying the dataset into a
+// store we then serve from IS the redistribution these terms gate, which is
+// exactly the R2-backed OamSpec pattern above (a daily collector mirrors a
+// regulator into R2). So these three are NEVER given an OamSpec / R2 index:
+// every call below hits the source live, holds nothing longer than an
+// in-process TTL cache measured in minutes, and writes nothing to any store.
+// Deliberately kept OUT of the OamId/OamSpec/OAM_LIST machinery above (which
+// is R2-index-shaped) rather than shoehorned in — LIVE_LIST is its own small,
+// parallel list.
+//
+// Greece (athex), Ireland (oamie), Bulgaria (beis) — added 2026-09-30, fleet
+// #2434/#2493/Ireland survey (Part 15). Greece and Ireland are a different
+// shape from LU/SI/EE above: Euronext Athens' and Euronext's own Terms of Use
+// don't just restrict reproduction, they explicitly forbid "bots or other
+// automated methods", scraping, crawlers and deep-links outright — the survey
+// stopped there and built nothing (WAIT). Bruce overruled that in chat
+// (2026-09-30): "proxy those too" — build them anyway as live, per-request
+// lookups, never stored, crawled politely (an honest, contactable User-Agent,
+// no IP rotation, no identity forging, low request volume, a short
+// normal-client cache at most). The same `mirror-needs-grant-proxy-does-not`
+// reasoning applies one layer down: a live call answering one caller's
+// question is a client, not the automated harvesting the terms are aimed at —
+// but this is a direct Bruce ruling for these two, not a re-derivation of the
+// robots.txt or licence rules, because what's banned here is access itself,
+// not just reuse. Bulgaria is different again: x3news and infostock.bg ban
+// automated access the same way (survey #2493), but BEIS
+// (beis.bia-bg.com) — a third disclosure agent three issuers actually use —
+// bans neither; it asks only for attribution, the Czechia/Hungary reuse-grant
+// shape. So Bulgaria is a live lookup here not because it needs Bruce's
+// override but for consistency with these other two and because its ~3-issuer
+// scope doesn't justify standing R2/collector infrastructure.
+type LiveId = 'luxoam' | 'seonet' | 'fi_ee' | 'athex' | 'oamie' | 'beis';
+
+interface LiveSpec {
+  id: LiveId;
+  country: 'LU' | 'SI' | 'EE' | 'GR' | 'IE' | 'BG';
+  longName: string;
+  adjective: string;
+  statusKey: 'luxoam_status' | 'seonet_status' | 'fi_ee_status' | 'athex_status' | 'oamie_status' | 'beis_status';
+  /** Why a live per-request call is not the redistribution/access these terms gate. */
+  termsNote: string;
+}
+
+const LIVE: Record<LiveId, LiveSpec> = {
+  luxoam: {
+    id: 'luxoam',
+    country: 'LU',
+    longName: 'the LuxSE OAM (Luxembourg Stock Exchange, fetched live)',
+    adjective: 'Luxembourgish',
+    statusKey: 'luxoam_status',
+    termsNote:
+      "Answered directly from LuxSE's own OAM (graphqlaz.luxse.com) for this request. LuxSE licenses commercial redistribution of its documents separately from ordinary access; a lookup made once on a caller's behalf is not that.",
+  },
+  seonet: {
+    id: 'seonet',
+    country: 'SI',
+    longName: 'SEOnet (Ljubljana Stock Exchange, fetched live)',
+    adjective: 'Slovenian',
+    statusKey: 'seonet_status',
+    termsNote:
+      "Answered directly from SEOnet's own RSS feed (seonet.ljse.si) for this request. The exchange's access conditions require its written consent for commercial reuse of its data; a lookup made once on a caller's behalf is not that. Only the ~20 most recent annual/semi-annual report announcements are visible this way (SEOnet caps the feed there); an older filing will not show up here even though it exists.",
+  },
+  fi_ee: {
+    id: 'fi_ee',
+    country: 'EE',
+    longName: "the FSA's OAM (oam.fi.ee, Estonia, fetched live)",
+    adjective: 'Estonian',
+    statusKey: 'fi_ee_status',
+    termsNote:
+      "Answered directly from the Estonian FSA's OAM (oam.fi.ee) for this request. The FSA's terms require its prior permission for commercial reuse of the information on the site, carving out journalism and non-profit use; a lookup made once on a caller's behalf is not that.",
+  },
+  athex: {
+    id: 'athex',
+    country: 'GR',
+    longName: 'Euronext Athens (the Greek OAM, fetched live)',
+    adjective: 'Greek',
+    statusKey: 'athex_status',
+    termsNote:
+      "Answered directly from Euronext Athens' own financial-data page (athens.euronext.com) for this request. Euronext Athens' Terms of Use forbid bots and automated access outright, not just redistribution; Bruce directed this pack to answer such a lookup live anyway (2026-09-30) rather than leave Greece unreachable, on the same reasoning as a live per-request call elsewhere in this pack — nothing is stored or mirrored.",
+  },
+  oamie: {
+    id: 'oamie',
+    country: 'IE',
+    longName: 'the Euronext Dublin OAM (Ireland, fetched live)',
+    adjective: 'Irish',
+    statusKey: 'oamie_status',
+    termsNote:
+      "Answered directly from Euronext's own public-announcements service (direct.euronext.com) for this request. Euronext's Terms of Use forbid bots and automated access outright, not just redistribution; Bruce directed this pack to answer such a lookup live anyway (2026-09-30) rather than leave Ireland unreachable, on the same reasoning as a live per-request call elsewhere in this pack — nothing is stored or mirrored. Fiscal year ends vary by issuer (not all are 31 December), so `period_end` is left unset rather than guessed from the filing title.",
+  },
+  beis: {
+    id: 'beis',
+    country: 'BG',
+    longName: 'BEIS (beis.bia-bg.com, a Bulgarian OAM-adjacent disclosure agent, fetched live)',
+    adjective: 'Bulgarian',
+    statusKey: 'beis_status',
+    termsNote:
+      "Answered directly from BEIS (beis.bia-bg.com) for this request. BEIS's terms ask only for attribution on reuse and do not restrict automated access, unlike Bulgaria's other disclosure agents (x3news, infostock.bg), which this pack does not call. Coverage is thin: only about three issuers use BEIS as their disclosure agent, so most Bulgarian ESEF filers will not appear here.",
+  },
+};
+const LIVE_LIST: LiveSpec[] = [LIVE.luxoam, LIVE.seonet, LIVE.fi_ee, LIVE.athex, LIVE.oamie, LIVE.beis];
+
+function liveForCountry(country: string | null | undefined): LiveSpec | null {
+  return LIVE_LIST.find((s) => s.country === (country ?? '').toUpperCase()) ?? null;
+}
+
+// ISIN is 2-letter country prefix + 9 alnum NSIN + 1 check digit — 12 chars
+// total. Used as a country hint when the caller passes an ISIN as `entity`/
+// `identifier` and nothing else has told us the country yet (#2573).
+const ISIN_RE = /^([A-Za-z]{2})[A-Za-z0-9]{9}\d$/;
+function isinCountryHint(input: string): string | null {
+  const m = ISIN_RE.exec(input.trim());
+  return m ? (m[1] as string).toUpperCase() : null;
+}
+
+const LIVE_ID_RE = /^(luxoam|seonet|fi_ee|athex|oamie|beis)-/;
+function liveForId(filingId: string): LiveSpec | null {
+  const m = LIVE_ID_RE.exec(filingId);
+  return m ? (LIVE[m[1] as LiveId] ?? null) : null;
+}
+
+type LiveLoad = { ok: true; rows: FilingRow[] } | { ok: false; reason: string };
+
+// Short, in-process only — never R2, never disk. A caller hitting the same
+// (source, name) inside a few minutes gets the cached rows instead of a fresh
+// upstream hit; a cold isolate always fetches live. This is "cache only what
+// a normal client would" (CLAUDE.md), not an index.
+const LIVE_CACHE_MS = 3 * 60_000;
+const liveCache = new Map<string, { at: number; load: LiveLoad }>();
+
+async function liveFetch(spec: LiveSpec, entityName: string | undefined): Promise<LiveLoad> {
+  // Not looseName(): that strips every non-ASCII character, which would
+  // collapse every distinct Cyrillic entityName (Bulgaria) to the same empty
+  // key and serve one query's cached, already-filtered rows to a different
+  // query. A plain locale-aware uppercase keeps distinct names distinct
+  // regardless of script.
+  const key = `${spec.id}|${entityName ? entityName.trim().toUpperCase() : ''}`;
+  const hit = liveCache.get(key);
+  if (hit && Date.now() - hit.at < LIVE_CACHE_MS) return hit.load;
+  let load: LiveLoad;
+  try {
+    const rows =
+      spec.id === 'luxoam'
+        ? await fetchLuxLive(entityName)
+        : spec.id === 'seonet'
+          ? await fetchSeonetLive(entityName)
+          : spec.id === 'fi_ee'
+            ? await fetchFiEeLive(entityName)
+            : spec.id === 'athex'
+              ? await fetchAthexLive(entityName)
+              : spec.id === 'oamie'
+                ? await fetchOamieLive(entityName)
+                : await fetchBeisLive(entityName);
+    load = { ok: true, rows };
+  } catch (e) {
+    load = { ok: false, reason: dropClassPrefix(e instanceof Error ? e.message : String(e)).slice(0, 200) };
+  }
+  liveCache.set(key, { at: Date.now(), load });
+  return load;
+}
+
+function liveStatus(spec: LiveSpec, load: LiveLoad): Record<string, unknown> {
+  if (!load.ok) {
+    return {
+      available: false,
+      reason: load.reason,
+      note: `${spec.longName} could not be reached for this response, so ${spec.adjective} rows come only from filings.xbrl.org (which lags this season by a filing season or more). ${spec.termsNote}`,
+    };
+  }
+  return {
+    available: true,
+    fetched_live: true,
+    rows_found: load.rows.length,
+    note: spec.termsNote,
+  };
+}
+
+// ── Luxembourg: LuxSE OAM GraphQL (graphqlaz.luxse.com) ─────────────────────
+// Keyless, no auth. Schema confirmed against the OAM page's own bundle
+// (2026-09-29): oamSubmissionsSearch takes issuerName server-side, so a named
+// lookup narrows upstream rather than filtering after a broad fetch.
+const LUX_GRAPHQL = 'https://graphqlaz.luxse.com/v1/graphql';
+const LUX_DOWNLOAD = 'https://dl.luxse.com/dl?v=';
+// depositType 10001 = "AFAE" = Annual financial and audit reports.
+const LUX_DEPOSIT_TYPE_ANNUAL = 10001;
+
+const LUX_SUBMISSIONS_QUERY = `query($depositType:Int,$issuerName:String,$publicationStartDate:Date,$publicationEndDate:Date,$pageSize:Int,$pageNumber:Int){
+  oamSubmissionsSearch(depositType:$depositType, issuerName:$issuerName, publicationStartDate:$publicationStartDate, publicationEndDate:$publicationEndDate, pageSize:$pageSize, pageNumber:$pageNumber){
+    totalHits
+    submissions { submissionId submissionTypeLabel actionsList publicationDate referenceYear referenceStartDate referenceEndDate issuerName }
+  }
+}`;
+const LUX_DETAIL_QUERY = `query($submissionId:Float!){
+  oamSubmissionDetail(submissionId:$submissionId){ documents { fileName url size category obsolete } }
+}`;
+
+interface LuxSubmission {
+  submissionId: number;
+  submissionTypeLabel: string;
+  actionsList: string;
+  publicationDate: string;
+  referenceYear: number | null;
+  referenceStartDate: string | null;
+  referenceEndDate: string | null;
+  issuerName: string;
+}
+
+async function luxGraphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+  const res = await pwFetch(LUX_GRAPHQL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
+    body: JSON.stringify({ query, variables }),
+  });
+  const body = (await res.json()) as { data?: T; errors?: Array<{ message: string }> };
+  if (!res.ok || body.errors?.length) {
+    throw new Error(`LuxSE OAM GraphQL error: ${body.errors?.map((e) => e.message).join('; ') || res.status}`);
+  }
+  if (!body.data) throw new Error('LuxSE OAM GraphQL returned no data');
+  return body.data;
+}
+
+async function fetchLuxLive(entityName?: string): Promise<FilingRow[]> {
+  const now = new Date();
+  const start = new Date(now.getTime() - 400 * 86_400_000); // ~13 months: this season plus the prior one
+  const data = await luxGraphql<{ oamSubmissionsSearch: { totalHits: number; submissions: LuxSubmission[] } }>(
+    LUX_SUBMISSIONS_QUERY,
+    {
+      depositType: LUX_DEPOSIT_TYPE_ANNUAL,
+      issuerName: entityName ?? null,
+      publicationStartDate: start.toISOString().slice(0, 10),
+      publicationEndDate: now.toISOString().slice(0, 10),
+      pageSize: 100,
+      pageNumber: 1,
+    },
+  );
+  const subs = data.oamSubmissionsSearch?.submissions ?? [];
+  // The download token is only worth an extra round trip for a narrow, named
+  // result set — never for a broad, unfiltered country listing (up to ~200
+  // rows/season), which would fan out one detail call per row.
+  const fetchDocs = Boolean(entityName) && subs.length > 0 && subs.length <= 10;
+  const rows: FilingRow[] = [];
+  for (const s of subs) {
+    let packageUrl: string | null = null;
+    if (fetchDocs) {
+      try {
+        const detail = await luxGraphql<{ oamSubmissionDetail: { documents: Array<{ fileName: string; url: string; category: string; obsolete: boolean }> } }>(
+          LUX_DETAIL_QUERY,
+          { submissionId: s.submissionId },
+        );
+        const docs = detail.oamSubmissionDetail?.documents ?? [];
+        const doc = docs.find((d) => !d.obsolete) ?? docs[0];
+        if (doc?.url) packageUrl = `${LUX_DOWNLOAD}${encodeURIComponent(doc.url)}`;
+      } catch {
+        /* the listing row still stands without a download link */
+      }
+    }
+    rows.push({
+      filing_id: `luxoam-${s.submissionId}`,
+      fxo_id: `luxoam-${s.submissionId}`,
+      source: 'luxoam',
+      entity_name: s.issuerName || null,
+      // The OAM listing carries no LEI; only the package's inline XBRL does,
+      // and this pack never opens the package (see the module note above).
+      entity_identifier: null,
+      country: 'LU',
+      regime: 'ESEF',
+      period_end: (s.referenceEndDate ?? '').slice(0, 10) || null,
+      language: null,
+      published_at: s.publicationDate,
+      date_added: s.publicationDate,
+      error_count: null,
+      warning_count: null,
+      inconsistency_count: null,
+      has_machine_readable_report: false,
+      json_url: null,
+      report_url: null,
+      viewer_url: null,
+      package_url: packageUrl,
+      title: s.submissionTypeLabel || null,
+      source_url: 'https://www.luxse.com/issuer-services-overview/oam',
+    });
+  }
+  return rows;
+}
+
+// ── Slovenia: SEOnet RSS (seonet.ljse.si) ───────────────────────────────────
+// Keyless. The RSS feed is capped at 20 items regardless of the
+// max_results_special param (survey Part 14), so this covers only the most
+// recent ~20 annual/semi-annual report announcements across all SI issuers —
+// a live lookup, not a full listing.
+const SEONET_RSS =
+  'https://seonet.ljse.si/rss/default.aspx?query=+language:NEU+max_results_special:500+age_in_days_special:400+doc_type_id:1020+sort:published+DESC';
+
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'");
+}
+
+interface SeonetItem {
+  docId: string;
+  title: string;
+  issuer: string;
+  pubDate: string;
+  link: string;
+}
+
+function parseSeonetRss(xml: string): SeonetItem[] {
+  const items: SeonetItem[] = [];
+  const itemRe = /<item>([\s\S]*?)<\/item>/g;
+  let m: RegExpExecArray | null;
+  while ((m = itemRe.exec(xml))) {
+    const block = m[1] ?? '';
+    const get = (tag: string): string => {
+      const mm = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(block);
+      return mm ? decodeXmlEntities(mm[1].trim()) : '';
+    };
+    const link = get('link');
+    const docId = /doc_id=(\d+)/.exec(link)?.[1] ?? '';
+    if (!docId) continue;
+    items.push({ docId, title: get('title'), issuer: get('author') || get('category'), pubDate: get('pubDate'), link });
+  }
+  return items;
+}
+
+// Titles are Slovenian free text ("Letno poročilo 2025", "… za leto 2025", "…
+// za poslovno leto 2025"); the RSS carries no structured period. A trailing
+// four-digit year in the title is the reporting year for a calendar-year
+// filer, which nearly all SI issuers are — treated as an inference, not a
+// fact, and flagged with `period_end_inferred`.
+function inferYearFromTitle(title: string): string | null {
+  const years = [...title.matchAll(/\b(20\d{2})\b/g)].map((m) => m[1]);
+  return years.length ? (years[years.length - 1] as string) : null;
+}
+
+async function fetchSeonetLive(entityName?: string): Promise<FilingRow[]> {
+  const res = await pwFetch(SEONET_RSS, { headers: { Accept: 'application/rss+xml', 'User-Agent': USER_AGENT } });
+  if (!res.ok) throw new Error(`SEOnet RSS error (${res.status})`);
+  const xml = await res.text();
+  const items = parseSeonetRss(xml);
+  const needle = entityName ? looseName(entityName) : null;
+  const prefiltered = needle ? items.filter((it) => looseName(it.issuer).includes(needle)) : items;
+  // Krka and others file the same announcement twice — once per language
+  // edition, same issuer and same pubDate, different doc_id (GOTCHA 3's
+  // pattern, one level up: this is two RSS items, not two facts). One per
+  // (issuer, pubDate); the English-looking title is preferred so the row's
+  // `title` is readable, matching this pack's English-first convention.
+  const bySlot = new Map<string, SeonetItem>();
+  for (const it of prefiltered) {
+    const key = `${looseName(it.issuer)}|${it.pubDate}`;
+    const prev = bySlot.get(key);
+    if (!prev || (/[čšžđ]/i.test(prev.title) && !/[čšžđ]/i.test(it.title))) bySlot.set(key, it);
+  }
+  const matched = [...bySlot.values()];
+  return matched.map((it) => {
+    const year = inferYearFromTitle(it.title);
+    return {
+      filing_id: `seonet-${it.docId}`,
+      fxo_id: `seonet-${it.docId}`,
+      source: 'seonet',
+      entity_name: it.issuer || null,
+      entity_identifier: null,
+      country: 'SI',
+      regime: 'ESEF',
+      period_end: year ? `${year}-12-31` : null,
+      language: null,
+      published_at: it.pubDate ? new Date(it.pubDate).toISOString() : null,
+      date_added: it.pubDate ? new Date(it.pubDate).toISOString() : null,
+      error_count: null,
+      warning_count: null,
+      inconsistency_count: null,
+      has_machine_readable_report: false,
+      json_url: null,
+      report_url: null,
+      viewer_url: null,
+      package_url: null,
+      title: it.title || null,
+      source_url: it.link,
+      period_end_inferred: year ? true : undefined,
+    };
+  });
+}
+
+// ── Estonia: the FSA's OAM (oam.fi.ee) ──────────────────────────────────────
+// Keyless. category=57 is "Majandusaasta aruanne" (annual report). The LEI
+// and period end are embedded in the ZIP attachment's own filename
+// (<LEI>-<period>-<lang>.zip), so the LEI is read straight off the detail
+// page's link text — no package is ever opened.
+const FI_EE_BASE = 'https://oam.fi.ee';
+
+function ddmmyyyy(d: Date): string {
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}.${mm}.${d.getFullYear()}`;
+}
+
+interface FiEeItem {
+  id: string;
+  issuer: string;
+  category: string;
+  title: string;
+  publishedRaw: string;
+}
+
+const FI_EE_ROW_RE =
+  /<tr class="(?:odd|even)">\s*<td><span class="text-nowrap">([^<]+)<\/span><\/td>\s*<td>([^<]*)<\/td>\s*<td>([^<]*)<\/td>\s*<td>([^<]*)<\/td>\s*<td>[\s\S]*?<\/td>\s*<td><a href="\/et\/borsiteated\/(\d+)">/g;
+
+function parseFiEeList(html: string): FiEeItem[] {
+  const out: FiEeItem[] = [];
+  let m: RegExpExecArray | null;
+  const re = new RegExp(FI_EE_ROW_RE);
+  while ((m = re.exec(html))) {
+    out.push({
+      publishedRaw: (m[1] ?? '').trim(),
+      issuer: decodeXmlEntities((m[2] ?? '').trim()),
+      category: decodeXmlEntities((m[3] ?? '').trim()),
+      title: decodeXmlEntities((m[4] ?? '').trim()),
+      id: m[5] as string,
+    });
+  }
+  return out;
+}
+
+// "31.08.2026 21:13:00" -> "2026-08-31T21:13:00". The site gives no UTC
+// offset, so none is invented — see fi_ee_status.note.
+function fiEeDateToIso(raw: string): string | null {
+  const m = /^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/.exec(raw);
+  if (!m) return null;
+  const [, dd, mm, yyyy, hh, min, ss] = m;
+  return `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}`;
+}
+
+const FI_EE_FILE_RE = /href="(\/sites\/default\/files\/[^"]+\.zip[^"]*)"/g;
+const FI_EE_FILENAME_RE = /([0-9A-Za-z]{20})-(\d{4}-\d{2}-\d{2})-([a-z]{2})\.zip/i;
+
+async function fetchFiEeDetail(id: string): Promise<{ lei: string | null; period_end: string | null; language: string | null; packageUrl: string | null }> {
+  const res = await pwFetch(`${FI_EE_BASE}/et/borsiteated/${id}`, { headers: { 'User-Agent': USER_AGENT } });
+  if (!res.ok) return { lei: null, period_end: null, language: null, packageUrl: null };
+  const html = await res.text();
+  const files: string[] = [];
+  let m: RegExpExecArray | null;
+  const re = new RegExp(FI_EE_FILE_RE);
+  while ((m = re.exec(html))) files.push(m[1] as string);
+  // Prefer the English-language package where both editions are attached.
+  const parsed = files
+    .map((path) => ({ path, m: FI_EE_FILENAME_RE.exec(path) }))
+    .filter((x): x is { path: string; m: RegExpExecArray } => Boolean(x.m));
+  const pick = parsed.find((x) => (x.m[3] ?? '').toLowerCase() === 'en') ?? parsed[0];
+  if (!pick) return { lei: null, period_end: null, language: null, packageUrl: files[0] ? `${FI_EE_BASE}${files[0]}` : null };
+  return {
+    lei: (pick.m[1] as string).toUpperCase(),
+    period_end: pick.m[2] as string,
+    language: (pick.m[3] as string).toLowerCase(),
+    packageUrl: `${FI_EE_BASE}${pick.path}`,
+  };
+}
+
+async function fetchFiEeLive(entityName?: string): Promise<FilingRow[]> {
+  const now = new Date();
+  const from = new Date(now.getFullYear() - 1, 0, 1); // covers this season and the prior one
+  const url = `${FI_EE_BASE}/et/borsiteated?category=57&publication_date_from=${ddmmyyyy(from)}&publication_date_to=${ddmmyyyy(now)}`;
+  const res = await pwFetch(url, { headers: { 'User-Agent': USER_AGENT } });
+  if (!res.ok) throw new Error(`Estonia FSA OAM listing error (${res.status})`);
+  const html = await res.text();
+  const items = parseFiEeList(html);
+  const needle = entityName ? looseName(entityName) : null;
+  const matched = needle ? items.filter((it) => looseName(it.issuer).includes(needle)) : items;
+  // The detail page (for the LEI + package link, both embedded in the
+  // attachment filename) is worth an extra round trip only for a small
+  // result set — capped regardless of whether a name narrowed it.
+  const DETAIL_CAP = 8;
+  const rows: FilingRow[] = [];
+  for (const [i, it] of matched.entries()) {
+    let lei: string | null = null;
+    let periodEnd: string | null = null;
+    let language: string | null = null;
+    let packageUrl: string | null = null;
+    if (i < DETAIL_CAP) {
+      try {
+        const d = await fetchFiEeDetail(it.id);
+        lei = d.lei;
+        periodEnd = d.period_end;
+        language = d.language;
+        packageUrl = d.packageUrl;
+      } catch {
+        /* the listing row still stands without the detail */
+      }
+    }
+    rows.push({
+      filing_id: `fi_ee-${it.id}`,
+      fxo_id: `fi_ee-${it.id}`,
+      source: 'fi_ee',
+      entity_name: it.issuer || null,
+      entity_identifier: lei,
+      country: 'EE',
+      regime: 'ESEF',
+      period_end: periodEnd,
+      language,
+      published_at: fiEeDateToIso(it.publishedRaw),
+      date_added: fiEeDateToIso(it.publishedRaw),
+      error_count: null,
+      warning_count: null,
+      inconsistency_count: null,
+      has_machine_readable_report: false,
+      json_url: null,
+      report_url: null,
+      viewer_url: null,
+      package_url: packageUrl,
+      title: it.title || null,
+      source_url: `${FI_EE_BASE}/et/borsiteated/${it.id}`,
+    });
+  }
+  return rows;
+}
+
+// ── Greece: Euronext Athens financial-data page (athens.euronext.com) ──────
+// Keyless, server-rendered (no AJAX round trip needed, unlike the site's
+// generic "announcements" search — that one only loads rows via a Drupal
+// Views AJAX endpoint that never honoured a text or company-id filter when
+// probed live on 2026-09-30). field_mig_category=2 selects "Financial
+// Statements ESEF" and field_mig_category_1=2 selects "Twelve months" —
+// empirically the value that returns rows titled "(<year>,Annual
+// report,<Consolidated|Parent>)" or "(<year>,Year Statement,<scope>)", both of
+// which are annual filings; the other field_mig_category_1 values (quarterly,
+// half-yearly, nine-monthly, balance-sheet variants) were not annual and are
+// never requested. field_mig_category_3 narrows to one issuer server-side,
+// but its values are a numeric taxonomy id specific to this site, not a
+// LEI or ticker, so a named lookup first resolves the caller's name against
+// the live option list the page itself exposes (cached in-process; the issuer
+// list changes rarely) rather than a hardcoded, driftable id table.
+const ATHENS_FINDATA = 'https://athens.euronext.com/en/market-data/financial-data';
+const ATHENS_CATEGORY_ESEF = '2';
+const ATHENS_CATEGORY_TWELVE_MONTHS = '2';
+
+interface AthexIssuer {
+  id: string;
+  name: string;
+}
+
+let athexIssuerCache: { at: number; issuers: AthexIssuer[] } | null = null;
+// Long TTL relative to LIVE_CACHE_MS: this is a directory of listed issuers,
+// not a result set, and changes on the order of IPOs/delistings, not minutes.
+const ATHEX_ISSUER_CACHE_MS = 6 * 60 * 60_000;
+
+function parseAthexIssuerOptions(html: string): AthexIssuer[] {
+  const out: AthexIssuer[] = [];
+  const re = /name="field_mig_category_3" value="(\d+)"[^/]*\/>\s*<label[^>]*>([^<]*)<\/label>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    out.push({ id: m[1] as string, name: decodeXmlEntities((m[2] ?? '').trim()) });
+  }
+  return out;
+}
+
+async function loadAthexIssuers(): Promise<AthexIssuer[]> {
+  if (athexIssuerCache && Date.now() - athexIssuerCache.at < ATHEX_ISSUER_CACHE_MS) return athexIssuerCache.issuers;
+  const res = await pwFetch(ATHENS_FINDATA, { headers: { 'User-Agent': USER_AGENT } });
+  if (!res.ok) throw new Error(`Euronext Athens financial-data page error (${res.status})`);
+  const issuers = parseAthexIssuerOptions(await res.text());
+  athexIssuerCache = { at: Date.now(), issuers };
+  return issuers;
+}
+
+function resolveAthexIssuer(issuers: AthexIssuer[], q: string): AthexIssuer | null {
+  const nq = looseName(q);
+  if (!nq) return null;
+  const exact = issuers.find((i) => looseName(i.name) === nq);
+  if (exact) return exact;
+  const prefix = issuers.filter((i) => looseName(i.name).startsWith(nq)).sort((a, b) => a.name.length - b.name.length)[0];
+  if (prefix) return prefix;
+  const contains = issuers.filter((i) => looseName(i.name).includes(nq)).sort((a, b) => a.name.length - b.name.length)[0];
+  return contains ?? null;
+}
+
+// One <tr>: a title link (sometimes "/en/more-options/announcements/<slug>",
+// sometimes a bare "/en/node/<id>" — both seen live on 2026-09-30, so the href
+// itself is not parsed as an id), then a Modified-Date <time>, then the ZIP
+// download link. "Financial [Rr]eport" because the site's own title casing is
+// inconsistent between filings (verified: "Financial report X" and "Financial
+// Report Y" both occur).
+const ATHEX_ROW_RE =
+  /<a href="[^"]+" hreflang="en">Financial [Rr]eport ([^(]+)\((\d{4}),([^,]+),(Consolidated|Parent)\)(-iXBRL|-XHTML)?<\/a>[\s\S]*?<time datetime="([^"]+)"[\s\S]*?<a href="(https:\/\/athens\.euronext\.com\/sites\/default\/files\/[^"]+\.zip)" role="button">/g;
+const ATHEX_UUID_RE = /\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\//i;
+
+function parseAthexRows(html: string): FilingRow[] {
+  const rows: FilingRow[] = [];
+  const re = new RegExp(ATHEX_ROW_RE);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const [, issuerRaw, year, typeRaw, scope, fmt, datetime, packageUrl] = m;
+    const uuid = ATHEX_UUID_RE.exec(packageUrl as string)?.[1];
+    if (!uuid) continue; // no stable id to key this row on — skip rather than guess one
+    const issuer = decodeXmlEntities((issuerRaw ?? '').trim());
+    const type = (typeRaw ?? '').trim();
+    rows.push({
+      filing_id: `athex-${uuid}`,
+      fxo_id: `athex-${uuid}`,
+      source: 'athex',
+      entity_name: issuer || null,
+      entity_identifier: null,
+      country: 'GR',
+      regime: 'ESEF',
+      // The page states only the reporting YEAR, not the exact period-end
+      // day; nearly all Greek issuers report on a calendar fiscal year (the
+      // same assumption GOTCHA 23's Slovenia live lookup makes), so this is
+      // flagged as an inference rather than presented as a fact from the
+      // source.
+      period_end: `${year}-12-31`,
+      period_end_inferred: true,
+      language: null,
+      published_at: datetime ?? null,
+      date_added: datetime ?? null,
+      error_count: null,
+      warning_count: null,
+      inconsistency_count: null,
+      has_machine_readable_report: (fmt ?? '').toLowerCase() === '-ixbrl',
+      json_url: null,
+      report_url: null,
+      viewer_url: null,
+      package_url: packageUrl as string,
+      title: `${year} ${type} — ${scope}${fmt ? ` (${fmt.slice(1)})` : ''}`,
+      source_url: ATHENS_FINDATA,
+    });
+  }
+  return rows;
+}
+
+async function fetchAthexLive(entityName?: string): Promise<FilingRow[]> {
+  let url = `${ATHENS_FINDATA}?field_mig_category=${ATHENS_CATEGORY_ESEF}&field_mig_category_1=${ATHENS_CATEGORY_TWELVE_MONTHS}`;
+  let matchedIssuer: AthexIssuer | null = null;
+  if (entityName) {
+    const issuers = await loadAthexIssuers();
+    matchedIssuer = resolveAthexIssuer(issuers, entityName);
+    if (matchedIssuer) url += `&field_mig_category_3=${matchedIssuer.id}`;
+  }
+  const res = await pwFetch(url, { headers: { 'User-Agent': USER_AGENT } });
+  if (!res.ok) throw new Error(`Euronext Athens financial-data error (${res.status})`);
+  let rows = parseAthexRows(await res.text());
+  if (entityName && !matchedIssuer) {
+    // The caller's name didn't match the live issuer directory (a typo, or a
+    // group/trading name the directory doesn't use) — fall back to matching
+    // against the issuer name each row itself carries, on the unfiltered
+    // (most-recent) page, rather than declining outright.
+    const needle = looseName(entityName);
+    rows = rows.filter((r) => looseName(r.entity_name ?? '').includes(needle));
+  }
+  return rows;
+}
+
+// ── Ireland: Euronext Dublin's public OAM announcements API ────────────────
+// Keyless. `direct.euronext.com` is Euronext's issuer-facing "Euronext
+// Direct" portal and most of it sits behind B2C login (confirmed live via its
+// own /api/gate/configuration.js), but the specific endpoint its "OAM Filing"
+// search calls — POST api/PublicAnnouncements/OAMs — answers without a
+// session token: a bare POST 401s, but the same POST with an Origin/Referer
+// pair the browser would send answers 200 with real, current Irish regulated
+// announcements. That is a CORS check, not authentication — verified by
+// requesting Ryanair's and Bank of Ireland's actual recent filings this way
+// on 2026-09-30. Only the "OAMDocument" GET (for the file itself) needs the
+// same headers to avoid the same 401.
+const OAMIE_BASE = 'https://direct.euronext.com';
+const OAMIE_SEARCH_URL = `${OAMIE_BASE}/api/PublicAnnouncements/OAMs`;
+// Verified live 2026-09-30: an Irish annual/audited financial report is
+// tagged this regulatoryCategory. Other categories (share transactions,
+// PDMR notifications, major holdings, …) are never annual reports and are
+// filtered out client-side rather than trusted to a server-side filter this
+// endpoint doesn't expose.
+const OAMIE_ANNUAL_CATEGORY = 'Annualfinancialandauditreports';
+const OAMIE_HEADERS: Record<string, string> = {
+  'Content-Type': 'application/json',
+  Accept: 'application/json',
+  'User-Agent': USER_AGENT,
+  Origin: OAMIE_BASE,
+  Referer: `${OAMIE_BASE}/oamfiling`,
+};
+
+interface OamieDocument {
+  id: string;
+  name: string;
+}
+interface OamieRecord {
+  filingDate: string;
+  companyName: string;
+  headline: string;
+  regulatoryCategory: string;
+  publishTime: string;
+  documents: OamieDocument[];
+}
+interface OamieResponse {
+  records: OamieRecord[];
+  totalItems: number;
+}
+
+async function fetchOamieLive(entityName?: string): Promise<FilingRow[]> {
+  const now = new Date();
+  const start = new Date(now.getTime() - 400 * 86_400_000); // ~13 months: this season plus the prior one
+  const res = await pwFetch(OAMIE_SEARCH_URL, {
+    method: 'POST',
+    headers: OAMIE_HEADERS,
+    body: JSON.stringify({
+      startDate: start.toISOString(),
+      endDate: now.toISOString(),
+      page: 0,
+      companyName: entityName ?? '',
+      firstLetter: '',
+    }),
+  });
+  if (!res.ok) throw new Error(`Euronext Dublin OAM error (${res.status})`);
+  const body = (await res.json()) as OamieResponse;
+  const annual = (body.records ?? []).filter((r) => r.regulatoryCategory === OAMIE_ANNUAL_CATEGORY);
+  return annual.map((r) => {
+    const doc = r.documents?.[0];
+    return {
+      filing_id: `oamie-${doc?.id ?? `${r.companyName}-${r.filingDate}`}`,
+      fxo_id: `oamie-${doc?.id ?? `${r.companyName}-${r.filingDate}`}`,
+      source: 'oamie',
+      entity_name: r.companyName || null,
+      entity_identifier: null,
+      country: 'IE',
+      regime: 'ESEF',
+      // Deliberately NOT inferred from the headline's year, unlike Greece and
+      // Slovenia: Irish fiscal year ends vary by issuer (Ryanair's is 31
+      // March, not 31 December), so a Dec-31 guess would be actively wrong
+      // for a real, common case rather than merely imprecise.
+      period_end: null,
+      language: null,
+      published_at: r.filingDate ?? null,
+      date_added: r.filingDate ?? null,
+      error_count: null,
+      warning_count: null,
+      inconsistency_count: null,
+      has_machine_readable_report: Boolean(doc && /\.xhtml$/i.test(doc.name)),
+      json_url: null,
+      report_url: null,
+      viewer_url: null,
+      package_url: doc ? `${OAMIE_BASE}/api/PublicAnnouncements/OAMDocument/${encodeURIComponent(doc.name)}?id=${doc.id}` : null,
+      title: r.headline || null,
+      source_url: `${OAMIE_BASE}/oamfiling`,
+    };
+  });
+}
+
+// ── Bulgaria: BEIS (beis.bia-bg.com) ────────────────────────────────────────
+// Keyless. BEIS's own public disclosure feed (index.php?p=publicinfo) is one
+// long page mixing every announcement type for every issuer it serves, with
+// no server-side filter for company or category — so this pack fetches that
+// one page (cached in-process) and both finds the issuer and picks out the
+// ESEF packages itself. An ESEF annual package's filename always ends
+// "<20-char LEI>-<YYYYMMDD>-BG-<CON|SEP>.<zip|xhtml>" regardless of whatever
+// ticker/prefix precedes the LEI (verified against all three issuers that use
+// BEIS: "VPOM_8945...", "KMM_485...", "HDOM_2021YCONS_485..." all end this
+// way) — anchoring on that suffix is what makes the LEI extraction reliable
+// without opening the package. A ".p7m"-suffixed file is a separately-signed
+// wrapper, not the report itself, and is skipped.
+const BEIS_FEED_URL = 'http://beis.bia-bg.com/index.php?p=publicinfo';
+const BEIS_ROW_RE =
+  /<p>([\d.]+\s[\d:]+)&nbsp;<A HREF="index\.php\?selcomp=(\d+)&amp;p=shortp">([^<]*)<\/a>&nbsp;:&nbsp;<b>([^<]*)<\/b><\/p>/gi;
+const BEIS_ESEF_RE = /href="pubinfo\/([^"]*?([A-Za-z0-9]{20})-(\d{8})-BG-(CON|SEP)\.(zip|xhtml))"/gi;
+
+// English spellings for the three issuers BEIS actually serves (survey
+// #2493), keyed by ticker — needed because entity_name comes back in
+// Cyrillic ("Випом АД - Видин") and does not substring-match a caller typing
+// the Latin company name.
+const BEIS_ALIASES: Record<string, string[]> = {
+  VPOM: ['VIPOM'],
+  KMM: ['KMM'],
+  HDOM: ['NASH DOM', 'NASHDOM', 'OUR HOME', 'HDOM'],
+};
+
+interface BeisHeader {
+  index: number;
+  date: string;
+  ticker: string;
+  name: string;
+}
+
+function parseBeisHeaders(html: string): BeisHeader[] {
+  const out: BeisHeader[] = [];
+  const re = new RegExp(BEIS_ROW_RE);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    out.push({ index: m.index, date: m[1] as string, ticker: (m[4] ?? '').trim(), name: decodeXmlEntities((m[3] ?? '').trim()) });
+  }
+  return out;
+}
+
+// "24.09.2026 16:10" -> "2026-09-24T16:10:00" (no UTC offset stated by the
+// source, so none is invented, matching fi_ee's convention above).
+function beisDateToIso(raw: string): string | null {
+  const m = /^(\d{1,2})\.(\d{2})\.(\d{4})\s+(\d{1,2}):(\d{2})$/.exec(raw.trim());
+  if (!m) return null;
+  const [, dd, mm, yyyy, hh, min] = m;
+  return `${yyyy}-${mm}-${(dd as string).padStart(2, '0')}T${(hh as string).padStart(2, '0')}:${min}:00`;
+}
+
+async function fetchBeisLive(entityName?: string): Promise<FilingRow[]> {
+  const res = await pwFetch(BEIS_FEED_URL, { headers: { 'User-Agent': USER_AGENT } });
+  if (!res.ok) throw new Error(`BEIS feed error (${res.status})`);
+  // BEIS serves windows-1251 (Cyrillic) bytes but sends no charset in its
+  // Content-Type header ("text/html" only, verified live), so a plain
+  // res.text() decodes as UTF-8 by default and turns every Cyrillic issuer
+  // name into "?" mojibake. Decode the raw bytes explicitly instead.
+  const html = new TextDecoder('windows-1251').decode(await res.arrayBuffer());
+  const headers = parseBeisHeaders(html);
+  const rows: FilingRow[] = [];
+  const seen = new Set<string>();
+  const re = new RegExp(BEIS_ESEF_RE);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const [, filename, lei, periodRaw, scope, ext] = m;
+    if (/\.p7m$/i.test(filename as string)) continue; // signed wrapper, not the package
+    const periodEnd = `${(periodRaw as string).slice(0, 4)}-${(periodRaw as string).slice(4, 6)}-${(periodRaw as string).slice(6, 8)}`;
+    const dedupKey = `${lei}|${periodEnd}|${scope}`;
+    if (seen.has(dedupKey)) continue; // prefer the first (most recent, since the feed lists newest first)
+    seen.add(dedupKey);
+    // The nearest preceding disclosure header names the issuer and date for
+    // this item; BEIS's feed is a flat timeline with no other linkage between
+    // a header and the documents attached under it.
+    let header: BeisHeader | undefined;
+    for (const h of headers) {
+      if (h.index <= (m.index as number)) header = h;
+      else break;
+    }
+    rows.push({
+      filing_id: `beis-${lei}-${periodEnd}-${scope}`,
+      fxo_id: `beis-${lei}-${periodEnd}-${scope}`,
+      source: 'beis',
+      entity_name: header?.name ?? null,
+      entity_identifier: (lei as string).toUpperCase(),
+      country: 'BG',
+      regime: 'ESEF',
+      period_end: periodEnd,
+      language: null,
+      published_at: header ? beisDateToIso(header.date) : null,
+      date_added: header ? beisDateToIso(header.date) : null,
+      error_count: null,
+      warning_count: null,
+      inconsistency_count: null,
+      has_machine_readable_report: true,
+      json_url: null,
+      report_url: null,
+      viewer_url: null,
+      package_url: `http://beis.bia-bg.com/pubinfo/${filename}`,
+      title: header ? `${header.name} (${header.ticker})` : null,
+      source_url: header ? `http://beis.bia-bg.com/index.php?selcomp=${header.index}&p=shortp` : BEIS_FEED_URL,
+    });
+  }
+  if (!entityName) return rows;
+  const needleUpper = entityName.trim().toUpperCase();
+  return rows.filter((r) => {
+    // entity_name is the issuer's own Cyrillic name (e.g. "Випом АД - Видин"),
+    // so a caller typing the Latin company name ("Vipom") matches neither it
+    // nor the ticker exactly ("VPOM" != "VIPOM") — verified live: an
+    // unaliased match returned rows_found: 0 for "Vipom" even though the
+    // filing exists. With only three issuers ever served by BEIS (survey
+    // #2493), a small static alias list is cheap to maintain and safer than
+    // a transliteration heuristic.
+    const nameUpper = (r.entity_name ?? '').toUpperCase();
+    const header = headers.find((h) => h.name === r.entity_name);
+    const ticker = (header?.ticker ?? '').toUpperCase();
+    const aliases = ticker ? (BEIS_ALIASES[ticker] ?? []) : [];
+    const aliasMatch = aliases.some((a) => needleUpper.includes(a) || a.includes(needleUpper));
+    return (
+      nameUpper.includes(needleUpper) ||
+      (ticker && (ticker === needleUpper || needleUpper.includes(ticker))) ||
+      aliasMatch ||
+      (r.entity_identifier ?? '').includes(needleUpper)
+    );
+  });
+}
+
+// Every live source's rows for one entity name, in parallel, each failure
+// isolated — one source being down never fails the other two or the caller's
+// main xbrl.org/R2-OAM result.
+//
+// `specs` (#2573) gates WHICH of the six sources are actually called: the
+// caller passes only the sources whose country matches this entity's known
+// country, so a Finnish/Spanish/etc. lookup makes zero GR/IE/BG/LU/SI/EE
+// requests. Defaults to every source for the genuinely-unknown-country case
+// (a name that resolves nowhere, or an unrecognized ISIN prefix) — trying all
+// six is still correct there, it's just no longer the default for every call.
+// Every source NOT in `specs` gets a `skipped`/`not_applicable` status block
+// instead of silently vanishing from the response.
+async function liveRowsForEntity(
+  name: string,
+  specs: LiveSpec[] = LIVE_LIST,
+): Promise<{ rows: FilingRow[]; statuses: Record<string, unknown> }> {
+  const settled = await Promise.allSettled(specs.map((spec) => liveFetch(spec, name)));
+  const rows: FilingRow[] = [];
+  const statuses: Record<string, unknown> = {};
+  specs.forEach((spec, i) => {
+    const r = settled[i] as PromiseSettledResult<LiveLoad>;
+    const load: LiveLoad = r.status === 'fulfilled' ? r.value : { ok: false, reason: dropClassPrefix(String(r.reason)).slice(0, 200) };
+    statuses[spec.statusKey] = liveStatus(spec, load);
+    if (load.ok) rows.push(...load.rows);
+  });
+  for (const spec of LIVE_LIST) {
+    if (specs.includes(spec)) continue;
+    statuses[spec.statusKey] = {
+      available: false,
+      skipped: true,
+      reason: 'not_applicable',
+      note: `${spec.longName} was not called — this entity's known country does not match ${spec.country}, so no request was made. If this entity actually files in ${spec.country}, esef_search_filings with country: "${spec.country}" triggers that lookup directly.`,
+    };
+  }
+  return { rows, statuses };
 }
 
 interface OamIndexRow {
@@ -1712,7 +2635,7 @@ function coverageNote(country: string | null | undefined, consulted: OamSpec[], 
 
 // ── tool definitions ───────────────────────────────────────────────────────
 const SCOPE_LINE =
-  'Covers 25,640 filings in two regimes: ESEF (~16,000 annual financial reports from 19 European countries — AT BE CY CZ DK ES FI FR GB GR IS IT LT NL NO PL PT RO SE) and UAIFRS (~9,600 Ukrainian IFRS filings, country UA). Pass `country` or `regime` to pin the scope you mean. Portuguese (PT), Spanish (ES) and Norwegian (NO) ESEF reports are also read directly from where each country publishes them — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway — so PT, ES and NO coverage follows official publication (typically within a day) rather than the index\'s months-long lag; each row names its `source` and those rows carry the official `published_at`. Swedish (SE) reports are likewise read from Finansinspektionen (FI), the Swedish OAM, which is the only source for Swedish FY2025 reports, Belgian (BE) reports from the FSMA\'s STORI database, the Belgian OAM, Maltese (MT) reports from the Malta Stock Exchange OAM, the only source for Maltese FY2025 reports, Croatian (HR) reports from HANFA\'s SRPI, the Croatian OAM and the only source for Croatian FY2025 reports, Hungarian (HU) reports from the MNB\'s Közzétételek site, the Hungarian OAM and the only source for Hungarian FY2025 reports, Lithuanian (LT) reports from oam.lt, the Lithuanian OAM run by Nasdaq Vilnius, as well as the index, Romanian (RO) reports from the ASF OAM, the only source for Romanian FY2025 reports, Cypriot (CY) reports from the Cyprus Stock Exchange public OAM, the only source for Cypriot FY2025 reports, and Latvian (LV) reports from CSRI, the Latvian OAM, the only source for Latvian FY2024 and FY2025 reports.';
+  'Covers 25,640 filings in two regimes: ESEF (~16,000 annual financial reports from 19 European countries — AT BE CY CZ DK ES FI FR GB GR IS IT LT NL NO PL PT RO SE) and UAIFRS (~9,600 Ukrainian IFRS filings, country UA). Pass `country` or `regime` to pin the scope you mean. Portuguese (PT), Spanish (ES) and Norwegian (NO) ESEF reports are also read directly from where each country publishes them — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway — so PT, ES and NO coverage follows official publication (typically within a day) rather than the index\'s months-long lag; each row names its `source` and those rows carry the official `published_at`. Swedish (SE) reports are likewise read from Finansinspektionen (FI), the Swedish OAM, which is the only source for Swedish FY2025 reports, Belgian (BE) reports from the FSMA\'s STORI database, the Belgian OAM, Maltese (MT) reports from the Malta Stock Exchange OAM, the only source for Maltese FY2025 reports, Croatian (HR) reports from HANFA\'s SRPI, the Croatian OAM and the only source for Croatian FY2025 reports, Hungarian (HU) reports from the MNB\'s Közzétételek site, the Hungarian OAM and the only source for Hungarian FY2025 reports, Lithuanian (LT) reports from oam.lt, the Lithuanian OAM run by Nasdaq Vilnius, as well as the index, Romanian (RO) reports from the ASF OAM, the only source for Romanian FY2025 reports, Cypriot (CY) reports from the Cyprus Stock Exchange public OAM, the only source for Cypriot FY2025 reports, and Latvian (LV) reports from CSRI, the Latvian OAM, the only source for Latvian FY2024 and FY2025 reports. Luxembourgish (LU), Slovenian (SI) and Estonian (EE) reports are also answered directly from the LuxSE OAM, SEOnet or the Estonian FSA\'s OAM for each request, because these three OAMs\' terms require the operator\'s consent for commercial reuse of their documents beyond ordinary access; a lookup made once on a caller\'s behalf is not that. Greek (GR) and Irish (IE) reports are likewise answered directly from Euronext Athens and the Euronext Dublin OAM for each request — these two sites\' terms forbid bots and automated access outright rather than just reuse, so these are Bruce-authorized live lookups rather than a re-derivation of the usual reasoning, kept live and never mirrored for the same reason. Bulgarian (BG) reports are answered directly from BEIS, a Bulgarian disclosure agent whose terms ask only for attribution (unlike Bulgaria\'s other disclosure agents, which this pack does not call) and covers only the roughly three issuers that use it. None of GR/IE/BG carry machine-readable facts (esef_filing_facts declines a live-lookup id and points at its `package_url`/`source_url`); SI is limited to the ~20 most recent Slovenian annual-report announcements; IE rows carry no `period_end` (Irish fiscal year ends vary by issuer); GR\'s `period_end` is inferred from the filing\'s reporting year, not stated exactly, and flagged `period_end_inferred`. All six (LU, SI, EE, GR, IE, BG) are pinned-country lookups only — pass `country` explicitly.';
 
 const tools: McpToolExport['tools'] = [
   {
@@ -1732,7 +2655,7 @@ const tools: McpToolExport['tools'] = [
         country: {
           type: 'string',
           description:
-            'ISO-2 country of the filing jurisdiction: AT, BE, CY, CZ, DK, ES, FI, FR, GB, GR, IS, IT, LT, MT, NL, NO, PL, PT, RO, SE (ESEF) or UA (UAIFRS).',
+            'ISO-2 country of the filing jurisdiction: AT, BE, CY, CZ, DK, ES, FI, FR, GB, GR, IS, IT, LT, MT, NL, NO, PL, PT, RO, SE (ESEF) or UA (UAIFRS). LU, SI, EE, IE and BG are also accepted — these five are looked up live (see the coverage note above) and pinning `country` to one of them is required to trigger that lookup; GR is always live-augmented in addition to the index.',
         },
         regime: {
           type: 'string',
@@ -1804,7 +2727,7 @@ const tools: McpToolExport['tools'] = [
     description:
       'Read the actual IFRS financial facts out of one published annual report — revenue, profit or loss, total assets, equity, operating cash flow, earnings per share and every other tagged figure, with the currency, the exact reporting period and the XBRL concept name. This is the numbers hop: esef_search_filings and esef_entity_filings prove a filing exists, this one opens its machine-readable xBRL-JSON report and returns what the company reported. ' +
       SCOPE_LINE +
-      ' Identify the filing by fxo_id from a search result (a Portuguese CMVM filing looks like "cmvm-1355933", a Spanish CNMV filing "cnmv-20912", a Norwegian NewsWeb filing "newsweb-668785-321602", a Swedish FI filing "fi-61807", a Belgian STORI filing "fsma-5c08f790-404c-4121-bd0b-0cf3350455da", a Maltese MSE filing "mse-BOV_20251231_CON_AFR_529900RWC8ZYB066JF16_20260326114707204", a Croatian SRPI filing "hanfa-1214588", a Hungarian MNB filing "mnb-909016", a Lithuanian oam.lt filing "oamlt-468051-338788", a Romanian ASF filing "asf-SNP-20260319180945", a Cypriot CSE filing "cse-222818-223858", a Latvian CSRI filing "csri-24777-1"), or just by company name or LEI plus an optional year and the latest matching report is used (the national copy for Portuguese, Spanish, Norwegian, Swedish, Belgian, Maltese, Croatian, Hungarian, Lithuanian, Romanian, Cypriot and Latvian issuers, otherwise the English-language edition). Pass `concept` to pull one line item (case-insensitive substring of the IFRS concept, e.g. "Revenue", "ProfitLoss", "Assets", "Equity", "CashFlows"); omit it for a headline projection of the main statement figures. Facts repeated across statements are collapsed, consolidated totals are separated from segment and equity-component breakdowns, and the full concept inventory of the report is returned so a follow-up query can target any line item.',
+      ' Identify the filing by fxo_id from a search result (a Portuguese CMVM filing looks like "cmvm-1355933", a Spanish CNMV filing "cnmv-20912", a Norwegian NewsWeb filing "newsweb-668785-321602", a Swedish FI filing "fi-61807", a Belgian STORI filing "fsma-5c08f790-404c-4121-bd0b-0cf3350455da", a Maltese MSE filing "mse-BOV_20251231_CON_AFR_529900RWC8ZYB066JF16_20260326114707204", a Croatian SRPI filing "hanfa-1214588", a Hungarian MNB filing "mnb-909016", a Lithuanian oam.lt filing "oamlt-468051-338788", a Romanian ASF filing "asf-SNP-20260319180945", a Cypriot CSE filing "cse-222818-223858", a Latvian CSRI filing "csri-24777-1"), or just by company name or LEI plus an optional year and the latest matching report is used (the national copy for Portuguese, Spanish, Norwegian, Swedish, Belgian, Maltese, Croatian, Hungarian, Lithuanian, Romanian, Cypriot and Latvian issuers, otherwise the English-language edition). A live-lookup id from esef_search_filings/esef_entity_filings for Luxembourg, Slovenia, Estonia, Greece, Ireland or Bulgaria (fxo_id starting "luxoam-", "seonet-", "fi_ee-", "athex-", "oamie-" or "beis-") has no xBRL-JSON to read — this tool declines and points at that filing\'s `package_url`/`source_url` instead. Pass `concept` to pull one line item (case-insensitive substring of the IFRS concept, e.g. "Revenue", "ProfitLoss", "Assets", "Equity", "CashFlows"); omit it for a headline projection of the main statement figures. Facts repeated across statements are collapsed, consolidated totals are separated from segment and equity-component breakdowns, and the full concept inventory of the report is returned so a follow-up query can target any line item.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1848,6 +2771,20 @@ const SORTS: Record<string, string> = {
   period_desc: '-period_end',
   period_asc: 'period_end',
 };
+
+// Shared with the LU/SI/EE live-row merge below (searchFilings): appending
+// live rows to an already-sorted page and never re-sorting would silently
+// contradict the `sort` the caller asked for and the response still claims.
+function rowComparator(sortKey: string): (a: FilingRow, b: FilingRow) => number {
+  const when = (r: FilingRow) => r.published_at ?? r.date_added ?? '';
+  const cmp: Record<string, (a: FilingRow, b: FilingRow) => number> = {
+    newest: (a, b) => when(b).localeCompare(when(a)),
+    oldest: (a, b) => when(a).localeCompare(when(b)),
+    period_desc: (a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? '') || when(b).localeCompare(when(a)),
+    period_asc: (a, b) => (a.period_end ?? '').localeCompare(b.period_end ?? '') || when(a).localeCompare(when(b)),
+  };
+  return cmp[sortKey] ?? cmp.newest;
+}
 
 function clampInt(v: unknown, def: number, min: number, max: number): number {
   const n = typeof v === 'number' ? v : Number.parseInt(String(v ?? ''), 10);
@@ -1990,14 +2927,7 @@ async function searchFilings(args: Record<string, unknown>) {
       if (got.length < 100 || (xbrlTotal != null && xbrl.length >= xbrlTotal)) break;
     }
     const merged = mergeRows(xbrl, oamRows);
-    const when = (r: FilingRow) => r.published_at ?? r.date_added ?? '';
-    const cmp: Record<string, (a: FilingRow, b: FilingRow) => number> = {
-      newest: (a, b) => when(b).localeCompare(when(a)),
-      oldest: (a, b) => when(a).localeCompare(when(b)),
-      period_desc: (a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? '') || when(b).localeCompare(when(a)),
-      period_asc: (a, b) => (a.period_end ?? '').localeCompare(b.period_end ?? '') || when(a).localeCompare(when(b)),
-    };
-    merged.rows.sort(cmp[sortKey] ?? cmp.newest);
+    merged.rows.sort(rowComparator(sortKey));
     total = merged.rows.length;
     rows = merged.rows.slice((page - 1) * limit, page * limit);
     mergeInfo = {
@@ -2019,6 +2949,47 @@ async function searchFilings(args: Record<string, unknown>) {
       merge_complete: xbrlTotal == null || xbrl.length >= xbrlTotal,
       note: "Portuguese, Spanish, Norwegian, Swedish, Belgian, Maltese, Croatian, Hungarian, Lithuanian, Romanian, Cypriot and Latvian results combine filings.xbrl.org with the country's official publication channel — CMVM for Portugal, CNMV for Spain, Oslo Børs NewsWeb for Norway, Finansinspektionen (FI) for Sweden, FSMA STORI for Belgium, the Malta Stock Exchange OAM (MSE) for Malta, HANFA SRPI for Croatia, the MNB's Közzétételek site for Hungary, oam.lt for Lithuania, the ASF OAM for Romania, the Cyprus Stock Exchange public OAM (CSE) for Cyprus, CSRI for Latvia. A report on both appears once (matched by LEI and period end); `source` says which copy the row describes and `also_on_xbrl_org` / `also_on_cmvm` / `also_on_cnmv` / `also_on_newsweb` / `also_on_fi` / `also_on_fsma` / `also_on_mse` / `also_on_hanfa` / `also_on_mnb` / `also_on_oamlt` / `also_on_asf` / `also_on_cse` / `also_on_csri` names the other. `published_at` is the regulator's official publication time (CNMV: to the minute where its disclosure feed carries the filing, else the day; NewsWeb: the announcement time, UTC; FI: to the minute, Stockholm offset; STORI: the issuer's publication time, Brussels offset, with STORI's own receipt time as `received_at`; MSE: the OAM announcement time, Malta offset; SRPI: the time HANFA's register received the submission, Zagreb offset; MNB: the publication time, Budapest offset; oam.lt: the announcement time, Vilnius offset; ASF: the upload time, Bucharest offset; CSE: the OAM publication time, Nicosia offset; CSRI: the time of the document version served, Riga offset); xbrl.org rows only carry `date_added`, the day that index picked the report up. A Spanish issuer that files individual and consolidated accounts in one package gets one row each, labelled by `report_scope`; so does a Croatian issuer, which files them as two separate SRPI packages, and a Romanian issuer, whose standalone report on the ASF OAM is plain XHTML with no inline XBRL (a row without facts).",
     };
+  }
+
+  // Luxembourg, Slovenia, Estonia: no R2 index exists for these three (see the
+  // "Live-only OAMs" note above), so they are never part of `merging` above.
+  // Consulted only when the caller pins the country — an open-country name
+  // search does not fan out to three more live upstreams on every call.
+  const liveSpec = (!regime || regime === 'ESEF') && args.with_errors !== true ? liveForCountry(country) : null;
+  let liveLoad: LiveLoad | null = null;
+  if (liveSpec) {
+    liveLoad = await liveFetch(liveSpec, entityName);
+    if (liveLoad.ok) {
+      const liveFiltered = liveLoad.rows.filter((r) => {
+        const pe = r.period_end ?? '';
+        if (periodEnd) return pe === periodEnd;
+        if (periodEndFrom && pe && pe < periodEndFrom) return false;
+        if (periodEndTo && pe && pe > periodEndTo) return false;
+        if (!periodEndFrom && !periodEndTo && year && pe && !pe.startsWith(String(year))) return false;
+        return true;
+      });
+      // Dedup by LEI + period end where the live row has an LEI (Estonia does;
+      // Luxembourg and Slovenia's listings do not — see the "Live-only OAMs"
+      // note). Falls back to normalised name + period end so a filing already
+      // present from xbrl.org under its LEI-resolved name is not also shown
+      // again under the live source's own listing spelling of the name.
+      const alreadyByLei = new Set(
+        rows.filter((r) => r.entity_identifier).map((r) => `${(r.entity_identifier ?? '').toUpperCase()}|${r.period_end ?? ''}`),
+      );
+      const alreadyByName = new Set(
+        rows.filter((r) => r.entity_name).map((r) => `${looseName(r.entity_name ?? '')}|${r.period_end ?? ''}`),
+      );
+      const fresh = liveFiltered.filter((r) => {
+        if (r.entity_identifier && alreadyByLei.has(`${r.entity_identifier.toUpperCase()}|${r.period_end ?? ''}`)) return false;
+        if (r.entity_name && alreadyByName.has(`${looseName(r.entity_name)}|${r.period_end ?? ''}`)) return false;
+        return true;
+      });
+      // Re-sort (not just append) — a caller who asked for `sort: "newest"`
+      // must not get these tacked onto the tail out of order, and re-slice to
+      // `limit` so the page size promise still holds.
+      rows = [...rows, ...fresh].sort(rowComparator(sortKey)).slice(0, limit);
+      total = total == null ? fresh.length : total + fresh.length;
+    }
   }
 
   const check = verifyFilters(rows, {
@@ -2049,6 +3020,7 @@ async function searchFilings(args: Record<string, unknown>) {
       filters_requested: filtersRequested,
       coverage_note: coverageNote(country, oamSpecs, oamLoads),
       ...oamStatuses(oamLoads, pinned ? undefined : shownStatus),
+      ...(liveSpec ? { [liveSpec.statusKey]: liveStatus(liveSpec, liveLoad ?? { ok: false, reason: `${liveSpec.id}_not_consulted` }) } : {}),
       source: merging && mergedNames.length ? `filings.xbrl.org + ${mergedNames.map((s) => s.id.toUpperCase()).join(' + ')}` : 'filings.xbrl.org',
     };
   }
@@ -2073,10 +3045,14 @@ async function searchFilings(args: Record<string, unknown>) {
     coverage_note: coverageNote(country, oamSpecs, oamLoads),
     ...(mergeInfo ? { merge: mergeInfo } : {}),
     ...oamStatuses(oamLoads, pinned ? undefined : shownStatus),
+    ...(liveSpec ? { [liveSpec.statusKey]: liveStatus(liveSpec, liveLoad ?? { ok: false, reason: `${liveSpec.id}_not_consulted` }) } : {}),
     filings: rows.map(publicRow),
-    source: merging && mergedNames.length
-      ? `filings.xbrl.org (XBRL International filings index) + ${mergedNames.map((s) => s.longName).join(' + ')}`
-      : 'filings.xbrl.org (XBRL International filings index)',
+    source: (() => {
+      const base = merging && mergedNames.length
+        ? `filings.xbrl.org (XBRL International filings index) + ${mergedNames.map((s) => s.longName).join(' + ')}`
+        : 'filings.xbrl.org (XBRL International filings index)';
+      return liveSpec && liveLoad?.ok && rows.some((r) => r.source === liveSpec!.id) ? `${base} + ${liveSpec.longName}` : base;
+    })(),
     query_url: url,
   };
 }
@@ -2092,7 +3068,7 @@ async function searchFilings(args: Record<string, unknown>) {
 interface Resolved {
   identifier: string;
   name: string;
-  match: 'identifier' | 'exact_name' | 'prefix_name' | 'contains_name' | `${OamId}_identifier` | `${OamId}_name`;
+  match: 'identifier' | 'exact_name' | 'prefix_name' | 'contains_name' | `${OamId}_identifier` | `${OamId}_name` | 'live_name';
   candidates?: Array<{ identifier: string; name: string }>;
 }
 
@@ -2178,7 +3154,9 @@ async function resolveWithOam(
   if (!lei || !best) return { resolved, oamLoads, oamRows: [], allOam: all };
   const rows = all.filter((r) => r.entity_identifier === lei);
   const name = rows.sort((a, b) => (b.published_at ?? '').localeCompare(a.published_at ?? ''))[0]?.entity_name ?? q;
-  const src: OamId = best.source === 'xbrl.org' ? 'cmvm' : best.source;
+  // `all` is built solely from OAM_LIST/oamFilings above, so best.source is
+  // never a LiveId here even though FilingRow.source's type is now wider.
+  const src: OamId = best.source === 'xbrl.org' ? 'cmvm' : (best.source as OamId);
   return {
     resolved: { identifier: lei, name, match: byLei.length ? `${src}_identifier` : `${src}_name` },
     oamLoads,
@@ -2217,7 +3195,9 @@ function oamYearFallback(
 function statusesForRows(loads: OamLoads, rows: FilingRow[]): Record<string, unknown> {
   const touched = new Set<OamId>();
   for (const r of rows) {
-    if (r.source !== 'xbrl.org') touched.add(r.source);
+    // Defensive: this is also called on row lists that could in principle
+    // include a live (LU/SI/EE) row, which has no OamSpec/R2 index.
+    if (r.source !== 'xbrl.org' && r.source in OAM) touched.add(r.source as OamId);
     const spec = oamForCountry(r.country);
     if (spec) touched.add(spec.id);
   }
@@ -2236,23 +3216,84 @@ async function entityFilings(args: Record<string, unknown>) {
   }
   const limit = clampInt(args.limit, 50, 1, 100);
 
-  const { resolved, oamLoads, oamRows } = await resolveWithOam(input, args);
-  if ('found' in resolved) return resolved;
+  const { resolved: resolvedRaw, oamLoads, oamRows } = await resolveWithOam(input, args);
+  let resolved: Resolved;
+  // Rows already fetched below, so the live-name fallback (next) doesn't
+  // fetch live sources twice for the same call.
+  let preloadedLive: { rows: FilingRow[]; statuses: Record<string, unknown> } | null = null;
+  if ('found' in resolvedRaw) {
+    // Neither filings.xbrl.org nor an R2-mirrored OAM resolved this name. For
+    // Ireland (and any company that exists only on a live-only source) this
+    // is not a fallback, it is the ONLY path: filings.xbrl.org has never
+    // carried an Irish filing and Ireland has no R2 OAM (GOTCHA 24), so
+    // reporting not_found before trying a live lookup by name would make an
+    // Irish-only company permanently unreachable through this tool. Verified
+    // live 2026-09-30: without this, esef_entity_filings{entity:"Ryanair"}
+    // returned entity_not_found even though esef_search_filings{entity_name:
+    // "Ryanair", country:"IE"} found two real filings.
+    //
+    // The country is genuinely unknown here UNLESS `input` itself is an ISIN
+    // (#2573) — in that case its 2-letter prefix names the country and only
+    // that one live source is worth trying; a name with no ISIN shape still
+    // falls back to all six, which is the Ireland-only-by-name path above.
+    const isinHint = isinCountryHint(input);
+    const specs = isinHint ? LIVE_LIST.filter((s) => s.country === isinHint) : LIVE_LIST;
+    preloadedLive = await liveRowsForEntity(input, specs);
+    const best = [...preloadedLive.rows].sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''))[0];
+    if (!best) return resolvedRaw;
+    resolved = { identifier: best.entity_identifier ?? best.fxo_id, name: best.entity_name ?? input, match: 'live_name' };
+  } else {
+    resolved = resolvedRaw;
+  }
 
   const url = `${API}/entities/${encodeURIComponent(resolved.identifier)}/filings${buildUrl('', {
     pageSize: limit,
     sort: '-period_end',
   })}`;
-  const oamOnly = fromOamOnly(resolved.match);
+  const oamOnly = fromOamOnly(resolved.match) || resolved.match === 'live_name';
   const xbrlRows = oamOnly
     ? []
     : ((await apiGet<Envelope<FilingRecord[]>>(url)).data ?? []).map((rec) => shapeFiling(rec, resolved.name));
+  // Luxembourg, Slovenia, Estonia: no R2 index for these three (see the
+  // "Live-only OAMs" note above), so they never reach oamRows. Tried for every
+  // resolved entity — cheap (one GraphQL/RSS/HTML fetch per source, in
+  // parallel, each failure isolated) and these three are exactly where
+  // filings.xbrl.org lags a full season, so the resolved name is looked up
+  // live too. Rows already present (matched by LEI + period end) are not
+  // duplicated.
+  // Live listings tend to carry the short trading name ("Krka", "Unior"),
+  // while `resolved.name` is often the full legal name filings.xbrl.org
+  // registered ("KRKA, tovarna zdravil, d.d., Novo mesto") — substring
+  // matching in the wrong direction misses the row entirely. The caller's own
+  // input is usually the shorter form, so it is tried first.
+  //
+  // Country gate (#2573): xbrl.org/OAM already resolved this entity, so its
+  // country is known from the very rows just fetched (xbrlRows carries the
+  // filing's own `country`; oamRows carries the OAM's fixed `spec.country`),
+  // plus an ISIN prefix on the raw input if the caller passed one. A Finnish
+  // issuer's rows never carry LU/SI/EE/GR/IE/BG, so none of those six get
+  // called. Only when this entity has NO rows with a known country at all
+  // (knownCountries stays empty) is the country genuinely unknown, and all
+  // six are tried, same as the unresolved-name fallback above.
+  const knownCountries = new Set<string>();
+  for (const r of [...xbrlRows, ...oamRows]) if (r.country) knownCountries.add(r.country.toUpperCase());
+  const isinHint = isinCountryHint(input);
+  if (isinHint) knownCountries.add(isinHint);
+  const liveSpecs = knownCountries.size ? LIVE_LIST.filter((s) => knownCountries.has(s.country)) : LIVE_LIST;
+  const live = preloadedLive ?? (await liveRowsForEntity(input.length <= resolved.name.length ? input : resolved.name, liveSpecs));
+  // Every row here — xbrlRows, oamRows, and the live rows above (matched by
+  // name against this SAME resolved entity) — is already scoped to one
+  // company, so a period_end already covered is the same report even when
+  // the live listing has no LEI to match on (Luxembourg, Slovenia).
+  const existingPeriods = new Set([...xbrlRows, ...oamRows].map((r) => r.period_end).filter((p): p is string => Boolean(p)));
+  const freshLive = live.rows.filter((r) => !(r.period_end && existingPeriods.has(r.period_end)));
+
   // One row per report per source: regulator rows join xbrl.org rows here and
   // are grouped with them by period below, so a report on both is one `report`.
-  const rows: FilingRow[] = [...xbrlRows, ...oamRows]
+  const rows: FilingRow[] = [...xbrlRows, ...oamRows, ...freshLive]
     .sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''))
     .slice(0, limit);
-  const statusBlocks = statusesForRows(oamLoads, [...xbrlRows, ...oamRows]);
+  const statusBlocks = { ...statusesForRows(oamLoads, [...xbrlRows, ...oamRows]), ...live.statuses };
 
   if (!rows.length) {
     return {
@@ -2260,6 +3301,7 @@ async function entityFilings(args: Record<string, unknown>) {
       reason: 'no_filings_for_entity',
       hint: `"${resolved.name}" (${resolved.identifier}) exists in the index but has no filings attached. Search by name with esef_search_filings in case the reports are filed under a subsidiary or a differently-named group entity.`,
       resolved_to: { identifier: resolved.identifier, name: resolved.name, match: resolved.match },
+      ...statusBlocks,
     };
   }
 
@@ -2315,9 +3357,12 @@ async function entityFilings(args: Record<string, unknown>) {
     reports,
     filings: rows.map(publicRow),
     ...statusBlocks,
-    source: oamRows.length
-      ? `filings.xbrl.org (XBRL International filings index) + ${OAM_LIST.filter((s) => oamRows.some((r) => r.source === s.id)).map((s) => s.longName).join(' + ')}`
-      : 'filings.xbrl.org (XBRL International filings index)',
+    source: (() => {
+      const parts = ['filings.xbrl.org (XBRL International filings index)'];
+      if (oamRows.length) parts.push(...OAM_LIST.filter((s) => oamRows.some((r) => r.source === s.id)).map((s) => s.longName));
+      if (freshLive.length) parts.push(...LIVE_LIST.filter((s) => freshLive.some((r) => r.source === s.id)).map((s) => s.longName));
+      return parts.join(' + ');
+    })(),
     query_url: oamOnly ? null : url,
   };
 }
@@ -2478,6 +3523,25 @@ async function resolveFilingForFacts(args: Record<string, unknown>): Promise<
 > {
   const fxoId = str(args.fxo_id) ?? str(args.filing_id) ?? str(args.filing);
   const idSpec = fxoId ? oamForId(fxoId) : null;
+  // Luxembourg / Slovenia / Estonia (live lookup, no R2 index): this pack
+  // never opens the ESEF package for these three (see the "Live-only OAMs"
+  // note above), so there is no xBRL-JSON to read — decline honestly rather
+  // than falling through to the generic fxo_id lookup below, which would
+  // query filings.xbrl.org with an id it never issued and answer
+  // "filing_not_found" for a filing that does exist.
+  const liveIdSpec = !idSpec && fxoId ? liveForId(fxoId) : null;
+  if (fxoId && liveIdSpec) {
+    return {
+      ok: false,
+      payload: {
+        found: false,
+        reason: 'no_machine_readable_report',
+        hint: `"${fxoId}" is a live-lookup id from ${liveIdSpec.longName}, which this tool does not convert to xBRL-JSON (see ${liveIdSpec.statusKey}), so there are no structured facts to read for it. Use the \`source_url\` / \`package_url\` from the esef_search_filings or esef_entity_filings result that returned this id to open the filing directly.`,
+        fxo_id: fxoId,
+        [liveIdSpec.statusKey]: { available: true, note: liveIdSpec.termsNote },
+      },
+    };
+  }
   if (fxoId && idSpec) {
     const load = await loadOam(idSpec, args);
     const row = load.ok ? findOamById(idSpec, load.idx, fxoId.toLowerCase()) : null;
@@ -2622,7 +3686,10 @@ async function filingFacts(args: Record<string, unknown>) {
   const filing = resolution.filing;
 
   if (filing.source !== 'xbrl.org') {
-    const spec = OAM[filing.source];
+    // resolveFilingForFacts() short-circuits any live (luxoam/seonet/fi_ee) id
+    // before ever building a filing row, so filing.source here is always a
+    // real OamSpec key.
+    const spec = OAM[filing.source as OamId];
     const short = spec.id.toUpperCase();
     if (!filing._json_key) {
       return {
@@ -2864,7 +3931,7 @@ async function filingFacts(args: Record<string, unknown>) {
     ...oamStatuses(resolution.oamLoads),
     source:
       filing.source !== 'xbrl.org'
-        ? `${OAM[filing.source].longName} — ESEF package ${filing.fxo_id}, published ${filing.published_at}`
+        ? `${OAM[filing.source as OamId].longName} — ESEF package ${filing.fxo_id}, published ${filing.published_at}`
         : `filings.xbrl.org — xBRL-JSON report ${filing.json_url}`,
   };
 }

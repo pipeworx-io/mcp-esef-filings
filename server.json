@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/esef-filings",
   "title": "Esef Filings",
-  "description": "XBRL filings index MCP — wraps the filings.xbrl.org JSON:API index run by",
-  "version": "0.1.10",
+  "description": "XBRL filings index MCP — wraps the filings.xbrl.org JSON:API index run by XBRL International, plus…",
+  "version": "0.1.11",
   "websiteUrl": "https://pipeworx.io/packs/esef-filings",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-esef-filings",

@@ -2573,6 +2573,12 @@ interface OamIndex {
   last_successful_check: string | null;
   last_error: { at: string; message: string } | null;
   last_row_errors?: string[];
+  // Non-zero means the regulator's own issuer-feed category filter is
+  // drifted (CNMV, fleet #3597): rows outside the expected report type were
+  // dropped on the last run, so a first-time filer who is not already known
+  // may be missing from this response until the regulator's filter recovers.
+  // Optional: only CNMV's collector sets it today.
+  issuer_universe_drift?: number;
   row_count: number;
   rows: OamIndexRow[];
 }
@@ -2634,6 +2640,10 @@ function oamStatus(spec: OamSpec, load: OamLoad): Record<string, unknown> {
   const last = i.last_successful_check ? Date.parse(i.last_successful_check) : NaN;
   const ageH = Number.isFinite(last) ? Math.round(((Date.now() - last) / 3_600_000) * 10) / 10 : null;
   const stale = ageH == null || ageH > OAM_STALE_HOURS;
+  const drift = i.issuer_universe_drift ?? 0;
+  const freshnessNote = stale
+    ? `${short} has not been checked successfully for ${ageH ?? 'an unknown number of'} hours${spec.scheduledDaily ? ' (expected daily)' : ''}. ${spec.adjective} filings published since ${i.last_successful_check ?? 'then'} may be missing — this is a collection outage, not an absence of filings.`
+    : `${spec.adjective} (${short}) coverage is current as of last_successful_check. A ${spec.adjective} filing missing here was not on ${short} at that time; anything published since may not be indexed yet.`;
   return {
     available: true,
     last_successful_check: i.last_successful_check,
@@ -2645,9 +2655,14 @@ function oamStatus(spec: OamSpec, load: OamLoad): Record<string, unknown> {
     packages_unavailable_last_run: i.last_row_errors?.length ?? 0,
     stale,
     filings_indexed: i.rows.length,
-    note: stale
-      ? `${short} has not been checked successfully for ${ageH ?? 'an unknown number of'} hours${spec.scheduledDaily ? ' (expected daily)' : ''}. ${spec.adjective} filings published since ${i.last_successful_check ?? 'then'} may be missing — this is a collection outage, not an absence of filings.`
-      : `${spec.adjective} (${short}) coverage is current as of last_successful_check. A ${spec.adjective} filing missing here was not on ${short} at that time; anything published since may not be indexed yet.`,
+    // fleet #3597: non-zero means the last run's issuer-feed category filter
+    // was drifted (CI prints a ::warning:: nobody reads this value from) --
+    // already-known issuers are unaffected, but a first-time filer not yet
+    // in the index may be missing until the regulator's filter recovers.
+    issuer_universe_drift: drift,
+    note: drift > 0
+      ? `${freshnessNote} In addition, ${short}'s own issuer-feed category filter returned ${drift} row(s) outside the expected report type on the last run — already-known issuers are unaffected, but a first-time filer would be missed until ${short}'s filter recovers.`
+      : freshnessNote,
   };
 }
 

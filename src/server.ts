@@ -10,7 +10,7 @@ import pack from './index.js';
 
 
 const server = new Server(
-  { name: '@pipeworx/mcp-esef-filings', version: '0.1.12' },
+  { name: '@pipeworx/mcp-esef-filings', version: '0.1.13' },
   { capabilities: { tools: {} } },
 );
 

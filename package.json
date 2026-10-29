@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-esef-filings",
-  "version": "0.1.13",
+  "version": "0.2.0",
   "description": "XBRL filings index MCP — wraps the filings.xbrl.org JSON:API index run by XBRL International, plus the machine-readable xBRL-JSON report behind each index row.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-esef-filings": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "esef-filings"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-esef-filings.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/esef-filings",
   "pipeworx": {
-    "sourceHash": "v1-0fd4e0e248e061a96b4ff3fe8b969dbbef8cba35298597e7d6db7970f1b31a44",
-    "sourceCommit": "445bacc5596a845c12d6945fbfcdf330ef60dcc4"
+    "mode": "gateway",
+    "slug": "esef-filings",
+    "gatewaySlug": "esef-filings",
+    "sourceHash": "v1-ef82b4040e4e229990156370f4c66b016d227740c4ba1265dfa26de47918cf00",
+    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
   }
 }
